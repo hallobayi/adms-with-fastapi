@@ -3,3 +3,4 @@ uvicorn
 mysql.connector
 requests
 aiohttp
+python-dotenv
