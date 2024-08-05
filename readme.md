@@ -1,4 +1,4 @@
-# ADMS (Attendance Device Management System) with fastAPI
+# ADMS (Attendance Device Management System)
 
 Another ADMS Server with fastAPI (Python 3.*) in universe. Project still development. If you want working project use adms php version, in below.
 
