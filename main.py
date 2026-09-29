@@ -1,15 +1,13 @@
-from fastapi import FastAPI
+"""Titik masuk aplikasi ADMS.
 
-app = FastAPI()
+Jalankan dengan:
+    uvicorn main:app --reload
+"""
 
-items = { "foo" : "The Foo Wrestless" }
+from __future__ import annotations
 
-@app.get("/items/{item_id}")
-async def read_item(item_id: str):
-    if item_id not in items:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return {"item": items[item_id]}
+from app.application import create_app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
+
+__all__ = ["app"]

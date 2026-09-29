@@ -1,21 +1,22 @@
+"""Kompatibilitas mundur.
 
-import mysql.connector
-from dotenv import load_dotenv
-import os
+Logika koneksi sudah dipindah ke `app.database`. Modul ini dipertahankan
+agar kode lama yang memanggil `db.connect()` tidak langsung rusak.
+Sebaiknya impor dari `app.database` pada kode baru.
+"""
 
-# Load environment variables
-load_dotenv()
+from __future__ import annotations
 
-MYSQL_HOST = os.getenv("MYSQL_HOST")
-MYSQL_USER = os.getenv("MYSQL_USER")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
-MYSQL_DB = os.getenv("MYSQL_DB")
+from app.database import connection, get_connection, ping
 
-# Connect to MySQL
+__all__ = ["connect", "connection", "get_connection", "ping"]
+
+
 def connect():
-    return mysql.connector.connect(
-        host=MYSQL_HOST,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DB
-    )
+    """Ambil satu koneksi MySQL dari pool.
+
+    Catatan: berbeda dengan versi lama, pemanggil bertanggung jawab
+    menutup koneksi (`conn.close()`). Lebih disarankan memakai
+    `app.database.connection()` sebagai context manager.
+    """
+    return get_connection()

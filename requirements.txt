@@ -1,6 +1,14 @@
 fastapi
-uvicorn
-mysql.connector
+uvicorn[standard]
+mysql-connector-python
+python-dotenv
+pydantic
+
+# Dipakai untuk pengujian
+pytest
+httpx
+
+# Belum dipakai di kode; dipertahankan agar tidak menghapus dependensi
+# yang mungkin masih dirujuk kode lain.
 requests
 aiohttp
-python-dotenv
