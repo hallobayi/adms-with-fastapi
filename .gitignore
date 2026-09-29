@@ -6,4 +6,4 @@ venv
 .env
 .htaccess
 .user.ini
-./workbuddy-ai
+.workbuddy-ai/
