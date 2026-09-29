@@ -2,38 +2,96 @@
 
 **DBMS:** MySQL 8.0+ (InnoDB, `utf8mb4`)
 **Engine:** semua tabel InnoDB
-**Migrasi:** `migrations/001_init_adms_push.sql`
+**Device target:** ZKTeco **X100C** (fingerprint only)
+**Migrasi:**
+- `migrations/001_init_adms_push.sql` — inti protokol push (7 tabel)
+- `migrations/002_biometric_sync_schedule.sql` — biometrik, sync 2 arah, shift (6 tabel)
+
+---
+
+## 0. Keputusan pemangku kepentingan
+
+| # | Keputusan | Konsekuensi pada skema |
+|---|---|---|
+| 1 | Device = **X100C** | Fingerprint saja; tidak ada tabel face/photo. `TransFlag` tetap `1111000000`. |
+| 2 | Tarik **hanya sidik jari** (bukan wajah) | Tambah `finger_template` dengan `MEDIUMBLOB`. Tidak ada `face_template`/`biophoto`. |
+| 3 | **Sinkronisasi dua arah** | Tambah `version` + `sync_state` di `finger_template`, dan tabel `sync_log` untuk jejak + resolusi konflik. |
+| 4 | Retensi `iclock_request` = **30 hari** | Kebijakan pembersihan + pemadatan `body_raw` (lihat §13). |
+| 5 | Absensi **dihubungkan ke jadwal shift** | Tambah `shift`, `shift_assignment`, `daily_attendance`, `holiday`. |
+
+### 0.1 Catatan penting tentang X100C
+
+**ADMS adalah fungsi OPSIONAL pada X100C.** Dari lembar spesifikasi: fitur
+standar mencakup SMS, Workcode, DST, Scheduled-bell; sedangkan **ADMS dan
+Webserver masuk daftar "Optional Functions"**. Artinya:
+
+> **Sebelum implementasi dimulai, pastikan firmware X100C yang dipakai sudah
+> mendukung dan mengaktifkan PUSH/ADMS.** Bila belum, device tidak akan pernah
+> memanggil server, dan seluruh pekerjaan integrasi tidak bisa diuji. Beberapa
+> unit perlu upgrade firmware terlebih dahulu (via USB), lalu fitur PUSH
+> diaktifkan.
+
+Ini risiko paling awal dan paling menentukan pada proyek ini — bukan hal yang
+bisa diabaikan sampai fase akhir.
+
+Spesifikasi X100C yang relevan:
+
+| Item | Nilai |
+|---|---|
+| Kapasitas sidik jari | 3.200 |
+| Kapasitas kartu | ID dan IC (opsional) |
+| Kapasitas log | 100.000 (120.000 di tabel lain) |
+| Komunikasi | TCP/IP, USB host/client (opsional) |
+| Zona waktu | Perlu diperhatikan; `TimeZone=7` dipakai referensi untuk WIB |
+| Verifikasi | Fingerprint, PIN, kartu RFID opsional |
+
+Karena kapasitas log **100.000 record**, perhatikan kebijakan `ResLogCount`
+dan pengambilan log berkala — bila penuh sebelum tersinkron, punch lama bisa
+terhapus di device dan hilang permanen.
 
 ---
 
 ## 1. Peta tabel
 
 ```
-                    ┌──────────────────┐
-                    │     device       │ 1 device = 1 mesin ZKTeco
-                    │  (SN, token,     │
-                    │   delay, opt)    │
-                    └────────┬─────────┘
-                             │
-        ┌────────────────────┼────────────────────┬──────────────────┐
-        │                    │                    │                  │
-        ▼                    ▼                    ▼                  ▼
-┌───────────────┐  ┌──────────────────┐  ┌──────────────┐  ┌────────────────┐
-│ iclock_request│  │  attendance_log  │  │ command_queue│  │  device_user   │
-│ body mentah   │  │  (punch absensi) │  │ antri perintah│ │  user di device│
-│ semua request │  │  UNIQUE hash     │  │ C:<id>:<cmd> │  │  (mirror)      │
-└───────────────┘  └──────────────────┘  └──────────────┘  └────────────────┘
-                             │
-                             ▼
-                   ┌──────────────────┐
-                   │    employee      │  data karyawan internal
-                   │  (pin, nama)     │  (sumber kebenaran)
-                   └──────────────────┘
+                           ┌──────────────────┐
+                           │      device      │ 1 device = 1 mesin X100C
+                           │ (SN, token,      │
+                           │  delay, opt)     │
+                           └────────┬─────────┘
+                                    │
+   ┌────────────┬───────────────┬───┴────────┬────────────────┬─────────────┐
+   │            │               │            │                │             │
+   ▼            ▼               ▼            ▼                ▼             ▼
+┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌──────────┐
+│iclock_   │ │attendance_log│ │command_  │ │device_   │ │finger_    │ │device_   │
+│request   │ │ (punch)      │ │queue     │ │user      │ │template   │ │operlog   │
+│body mntah│ │ UNIQUE hash  │ │C:<id>:cmd│ │(mirror)  │ │(BLOB)     │ │          │
+└──────────┘ └──────┬───────┘ └──────────┘ └──────────┘ └─────┬─────┘ └──────────┘
+                    │                                          │
+                    ▼                                          │
+          ┌──────────────────┐                                 │
+          │    employee      │◄────────────────────────────────┘
+          │ (pin, nama)      │  sumber kebenaran
+          └───┬──────────┬───┘
+              │          │
+              ▼          ▼
+   ┌────────────────┐  ┌──────────────────┐
+   │shift_assignment│→ │      shift       │  jadwal kerja
+   └────────────────┘  └──────────────────┘
+              │
+              ▼
+   ┌────────────────────┐        ┌───────────┐
+   │  daily_attendance  │        │  sync_log │  jejak sync 2 arah
+   │  (hasil olahan)    │        └───────────┘
+   └────────────────────┘
 ```
 
 **Alur data:** `iclock_request` menyimpan **setiap** request apa adanya →
-parser menulis ke `attendance_log` / `device_user`. Tabel mentah inilah yang
-membuat kita bisa memperbaiki parser lalu memproses ulang data lama.
+parser menulis ke `attendance_log` / `device_user` / `finger_template`.
+Tabel mentah inilah yang membuat kita bisa memperbaiki parser lalu memproses
+ulang data lama. `attendance_log` kemudian diolah oleh job terjadwal menjadi
+`daily_attendance` dengan bantuan `shift_assignment`.
 
 ---
 
@@ -419,10 +477,283 @@ CREATE TABLE device_operlog (
 
 ---
 
+## 8b. Tabel `finger_template` — template sidik jari
+
+Ini tabel yang memenuhi keputusan "HANYA FINGER". Tanpa ini, sinkronisasi dua
+arah tidak mungkin: device tidak bisa memverifikasi sidik jari yang belum
+dikirim kepadanya.
+
+> **Catatan format:** Model X100C **tidak dikonfirmasi** memakai header 6 byte
+> ZKTeco klasik (`size`/`uid`/`finger_id`/`flag`). Referensi implementasi yang
+> diuji di X100-C hanya mencatat body mentah tanpa menguraikannya. Karena itu
+> skema ini menyimpan blob apa adanya dan memperlakukannya sebagai data buram
+> — lihat §8b.1.
+
+```sql
+CREATE TABLE finger_template (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    employee_id   BIGINT UNSIGNED NULL COMMENT 'NULL bila PIN belum dipetakan',
+    device_id     BIGINT UNSIGNED NULL
+                  COMMENT 'NULL = template master (milik server), bukan salinan device',
+    pin           VARCHAR(24)     NOT NULL,
+    finger_index  TINYINT UNSIGNED NOT NULL COMMENT 'Slot jari 0-9',
+    template_data MEDIUMBLOB      NOT NULL COMMENT 'Blob template mentah dari device',
+    template_size INT UNSIGNED    NOT NULL COMMENT 'Ukuran menurut header 2 byte pertama',
+    version       INT UNSIGNED    NOT NULL DEFAULT 1
+                  COMMENT 'Naik setiap template berubah; dipakai resolusi konflik',
+    quality_score TINYINT UNSIGNED NULL COMMENT 'Perkiraan kualitas dari heuristik byte',
+    is_valid      TINYINT(1)      NOT NULL DEFAULT 1,
+    source        ENUM('device','server_import') NOT NULL DEFAULT 'device',
+    sync_state    ENUM('in_sync','pending_push','pending_pull','conflict','failed')
+                  NOT NULL DEFAULT 'in_sync',
+    last_pushed_at DATETIME       NULL COMMENT 'Terakhir dikirim ke device',
+    last_pulled_at DATETIME       NULL COMMENT 'Terakhir ditarik dari device',
+    created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                  ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_finger_slot (pin, finger_index, device_id),
+    KEY idx_finger_employee (employee_id),
+    KEY idx_finger_device (device_id),
+    KEY idx_finger_sync (sync_state),
+
+    CONSTRAINT fk_finger_employee FOREIGN KEY (employee_id)
+        REFERENCES employee (id) ON DELETE SET NULL,
+    CONSTRAINT fk_finger_device FOREIGN KEY (device_id)
+        REFERENCES device (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Template sidik jari per PIN dan slot jari';
+```
+
+### 8b.1 Mengapa menyimpan blob mentah
+
+Template sidik jari ZKTeco adalah **format binary rahasia** yang tidak
+didokumentasikan resmi dan berbeda antar keluarga firmware. Menguraikannya
+berdasarkan dugaan adalah cara paling cepat menghasilkan data rusak yang tidak
+bisa dipulihkan.
+
+Karena itu:
+- `template_data` menyimpan **byte persis** seperti yang dikirim device.
+- `template_size` dan `quality_score` bersifat **informasional** — berguna untuk
+  memantau, **bukan** untuk memutuskan validitas.
+- **Jangan pernah** memotong, mengubah, atau "menormalkan" blob ini.
+
+**Verifikasi wajib sebelum mengandalkan isi template:** tarik template dari
+device, kirim ulang persis apa adanya, lalu pastikan user bisa verifikasi
+sidik jari di device. Bila berhasil, format blob sudah benar — tanpa perlu tahu
+strukturnya.
+
+### 8b.2 Mengapa ada `device_id` yang boleh NULL
+
+- `device_id = NULL` → **template master**, dimiliki server. Ini "sumber
+  kebenaran" yang dipakai untuk mendorong ke device mana pun.
+- `device_id = <id>` → **salinan** di device tertentu.
+
+Pemisahan ini penting untuk sinkronisasi dua arah: bila device A mengirim
+template baru, ia disimpan sebagai master (`device_id NULL`, `version + 1`),
+lalu disebarkan ke semua device lain sebagai baris salinan. Tanpa pemisahan
+ini, kita tidak bisa membedakan "template ini berasal dari device mana".
+
+### 8b.3 Siklus `sync_state`
+
+| State | Arti |
+|---|---|
+| `in_sync` | Server dan device sepakat |
+| `pending_push` | Master berubah, menunggu dikirim ke device |
+| `pending_pull` | Device melaporkan ada, menunggu ditarik |
+| `conflict` | Ada versi berbeda dan tidak bisa diputuskan otomatis |
+| `failed` | Pengiriman/penarikan gagal berulang |
+
+`version` naik setiap template berubah. Saat membandingkan, **versi lebih
+tinggi menang**; bila versi sama tapi isi berbeda → `conflict` + catat di
+`sync_log` untuk ditinjau admin.
+
+---
+
+## 8c. Tabel `sync_log` — jejak sinkronisasi dua arah
+
+```sql
+CREATE TABLE sync_log (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    device_id     BIGINT UNSIGNED NULL,
+    serial_number VARCHAR(64)     NOT NULL,
+    direction     ENUM('server_to_device','device_to_server') NOT NULL,
+    entity_type   ENUM('user','finger_template','card','command') NOT NULL,
+    pin           VARCHAR(24)     NULL,
+    finger_index  TINYINT UNSIGNED NULL,
+    action        ENUM('create','update','delete','query') NOT NULL,
+    outcome       ENUM('applied','skipped','conflict','failed') NOT NULL,
+    conflict_detail VARCHAR(255)  NULL,
+    resolved_by   ENUM('server_wins','device_wins','manual','none')
+                  NOT NULL DEFAULT 'none',
+    command_id    BIGINT UNSIGNED NULL,
+    created_at    DATETIME(3)     NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+
+    PRIMARY KEY (id),
+    KEY idx_sync_device_created (device_id, created_at),
+    KEY idx_sync_pin (pin, created_at),
+    KEY idx_sync_conflict (outcome, created_at),
+
+    CONSTRAINT fk_sync_device FOREIGN KEY (device_id)
+        REFERENCES device (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Jejak sinkronisasi dua arah server <-> device';
+```
+
+**Catatan desain:** dengan 3.200 slot sidik jari per device dan banyak device,
+sinkronisasi dua arah bisa membanjiri tabel ini. **Jangan** mencatat setiap
+`skipped`; hanya catat `applied`, `conflict`, dan `failed`. `skipped` yang
+normal (mis. "sudah sinkron") cukup dihitung di metrik.
+
+---
+
+## 8d–8g. Tabel jadwal shift & kehadiran harian
+
+Lihat `migrations/002_biometric_sync_schedule.sql` untuk definisi lengkap
+`shift`, `shift_assignment`, `daily_attendance`, dan `holiday`.
+
+### 8d. `shift`
+
+```sql
+CREATE TABLE shift (
+    id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    name              VARCHAR(64)     NOT NULL,
+    start_time        TIME            NOT NULL,
+    end_time          TIME            NOT NULL
+                      COMMENT 'Bila <= start_time, shift melewati tengah malam',
+    late_tolerance_min SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    early_leave_tol_min SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    is_overnight      TINYINT(1)      NOT NULL DEFAULT 0,
+    is_active         TINYINT(1)      NOT NULL DEFAULT 1,
+    created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                      ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_shift_name (name),
+    KEY idx_shift_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Definisi shift kerja';
+```
+
+**Catatan desain — shift lewat tengah malam.** Shift malam (`22:00`–`06:00`)
+adalah tempat kesalahan paling umum terjadi. Aturan yang dipakai:
+`is_overnight = 1` bila `end_time <= start_time`. Saat mencocokkan punch ke
+shift, punch yang jatuh **setelah tengah malam** harus dipetakan ke
+`work_date` **hari sebelumnya**, bukan hari kalendernya. Tanpa ini, shift
+malam akan terlihat sebagai "alpa" setiap hari.
+
+Disarankan juga menyimpan `late_tolerance_min` **per shift**, bukan global —
+toleransi untuk shift malam biasanya berbeda dengan shift pagi.
+
+### 8e. `shift_assignment`
+
+```sql
+CREATE TABLE shift_assignment (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    employee_id BIGINT UNSIGNED NOT NULL,
+    shift_id    BIGINT UNSIGNED NOT NULL,
+    effective_from DATE         NOT NULL,
+    effective_to   DATE         NULL COMMENT 'NULL = berlaku sampai dicabut',
+    work_days   SET('MO','TU','WE','TH','FR','SA','SU') NOT NULL
+                DEFAULT 'MO,TU,WE,TH,FR',
+    created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_assign (employee_id, shift_id, effective_from),
+    KEY idx_assign_employee (employee_id, effective_from),
+    KEY idx_assign_shift (shift_id),
+
+    CONSTRAINT fk_assign_employee FOREIGN KEY (employee_id)
+        REFERENCES employee (id) ON DELETE CASCADE,
+    CONSTRAINT fk_assign_shift FOREIGN KEY (shift_id)
+        REFERENCES shift (id) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Penugasan shift ke karyawan per rentang tanggal';
+```
+
+**Catatan desain:** `ON DELETE RESTRICT` pada `shift_id` **disengaja** —
+menghapus shift yang masih dipakai penugasan akan membuat perhitungan
+keterlambatan kehilangan acuan. Admin harus mencabut penugasan dulu. Sudah
+diuji: penghapusan ditolak dengan `ERROR 1451`.
+
+### 8f. `daily_attendance`
+
+```sql
+CREATE TABLE daily_attendance (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    employee_id     BIGINT UNSIGNED NOT NULL,
+    work_date       DATE            NOT NULL,
+    shift_id        BIGINT UNSIGNED NULL,
+    first_in        DATETIME        NULL,
+    last_out        DATETIME        NULL,
+    punch_count     SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    late_minutes    INT             NOT NULL DEFAULT 0,
+    early_leave_minutes INT         NOT NULL DEFAULT 0,
+    overtime_minutes INT            NOT NULL DEFAULT 0,
+    worked_minutes  INT             NULL COMMENT 'NULL bila punch tidak lengkap',
+    status          ENUM('present','late','absent','incomplete','holiday','leave')
+                    NOT NULL DEFAULT 'present',
+    is_manual       TINYINT(1)      NOT NULL DEFAULT 0
+                    COMMENT '1 = dikoreksi manual, jangan ditimpa job otomatis',
+    note            VARCHAR(255)    NULL,
+    computed_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                    ON UPDATE CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_daily (employee_id, work_date),
+    KEY idx_daily_date (work_date),
+    KEY idx_daily_status (status, work_date),
+    KEY idx_daily_shift (shift_id),
+
+    CONSTRAINT fk_daily_employee FOREIGN KEY (employee_id)
+        REFERENCES employee (id) ON DELETE CASCADE,
+    CONSTRAINT fk_daily_shift FOREIGN KEY (shift_id)
+        REFERENCES shift (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Ringkasan kehadiran harian';
+```
+
+**Catatan desain:**
+- `status='incomplete'` penting. Punch yang hanya berisi satu sisi (masuk saja
+  tanpa keluar) **tidak boleh** diperlakukan sebagai "hadir penuh" maupun
+  "alpa" — keduanya salah dan akan memicu keluhan. Tandai sebagai tidak
+  lengkap dan minta koreksi.
+- `is_manual` melindungi koreksi admin dari ditimpa job otomatis. Setiap job
+  hitung ulang **wajib** menambahkan `AND is_manual = 0`.
+- `daily_attendance` adalah **turunan**, bukan sumber kebenaran.
+  `attendance_log` tetap aslinya, dan tabel ini bisa dihitung ulang kapan saja.
+
+### 8g. `holiday`
+
+```sql
+CREATE TABLE holiday (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    holiday_date DATE           NOT NULL,
+    name        VARCHAR(128)    NOT NULL,
+    is_recurring TINYINT(1)     NOT NULL DEFAULT 0,
+    created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_holiday (holiday_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  COMMENT='Hari libur';
+```
+
+Tanpa tabel ini, job harian akan menandai seluruh karyawan **alpa** di hari
+libur nasional. Ini bug yang sangat terlihat dan mudah dicegah.
+
+---
+
 ## 9. Urutan penerapan (migrasi)
 
 Urutan penting karena foreign key:
 
+**Migrasi 001** (`001_init_adms_push.sql`):
 ```
 1. device
 2. employee
@@ -431,6 +762,22 @@ Urutan penting karena foreign key:
 5. device_user         (FK → device)
 6. command_queue       (FK → device)
 7. device_operlog      (FK → device)
+```
+
+**Migrasi 002** (`002_biometric_sync_schedule.sql`):
+```
+8.  finger_template      (FK → employee, device)
+9.  sync_log             (FK → device)
+10. shift
+11. shift_assignment     (FK → employee, shift)
+12. daily_attendance     (FK → employee, shift)
+13. holiday
+```
+
+Jalankan berurutan:
+```bash
+mysql -u <user> -p <db> < migrations/001_init_adms_push.sql
+mysql -u <user> -p <db> < migrations/002_biometric_sync_schedule.sql
 ```
 
 ---
@@ -506,12 +853,318 @@ ORDER BY total DESC;
 
 | Tabel | Pertumbuhan | Kebijakan |
 |---|---|---|
-| `iclock_request` | Sangat cepat | Retensi 30 hari; partisi bulanan; simpan statistik saja |
+| `iclock_request` | Sangat cepat | **Retensi 30 hari** (lihat §12) |
 | `attendance_log` | Cepat (~1000/hari/device) | Permanen; arsipkan per tahun |
 | `device_operlog` | Sedang | Retensi 90 hari |
 | `command_queue` | Lambat | Hapus baris `acked`/`failed` > 30 hari |
 | `device_user` | Statis | Ikut device (CASCADE) |
+| `finger_template` | Statis (~3.200 blob/device) | Perkirakan **~30–60 MB/device**; lihat §12 |
+| `sync_log` | Cepat | Hanya catat `applied`/`conflict`/`failed`; retensi 90 hari |
+| `daily_attendance` | Terkendali (1 baris/karyawan/hari) | Permanen; bisa dihitung ulang |
 
 **Penting:** jangan aktifkan `Realtime=1` bersamaan dengan `TransInterval`
 rendah pada banyak device tanpa memantau beban tulis. Beberapa device di satu
 lokasi bisa menghasilkan ribuan baris `attendance_log` per jam pada jam sibuk.
+
+**Penting (X100C):** kapasitas log device hanya **100.000 record**. Bila
+penuh sebelum tersinkron, punch lama **terhapus di device dan hilang
+permanen** — tidak ada cara menariknya kembali. Pastikan pengambilan log
+berjalan jauh sebelum batas itu tercapai, dan pantau `AttLogCount` dari
+`GET OPTION`.
+
+---
+
+## 12. Kebijakan pemeliharaan detail
+
+### 12.1 Retensi `iclock_request` = 30 hari
+
+Bila `iclock_request` tumbuh paling cepat, jangan sekadar `DELETE` — pindahkan
+statistiknya dulu, lalu hapus `body_raw` (yang menjadi biaya terbesar).
+
+```sql
+-- Tahap 1: padatkan body mentah untuk request lama, pertahankan statistiknya.
+-- Semua informasi yang berguna untuk diagnosis sudah ada di kolom lain
+-- (counts, process_status, error_message).
+UPDATE iclock_request
+SET body_raw = NULL
+WHERE body_raw IS NOT NULL
+  AND created_at < NOW() - INTERVAL 7 DAY
+  AND process_status <> 'failed'
+  AND table_name <> 'USERINFO';   -- USERINFO perlu utuh untuk pemrosesan ulang
+
+-- Tahap 2: hapus dari DB, tapi simpan jalur arsip untuk yang gagal.
+-- Semua request yang GAGAL harus sudah diarsipkan ke storage terlebih dahulu,
+-- karena inilah baris yang nanti perlu diproses ulang setelah parser diperbaiki.
+DELETE FROM iclock_request
+WHERE created_at < NOW() - INTERVAL 30 DAY
+  AND process_status <> 'failed';
+
+-- Tahap 3: request gagal diarsipkan setelah 90 hari.
+DELETE FROM iclock_request
+WHERE created_at < NOW() - INTERVAL 90 DAY;
+```
+
+**Aturan penting:** baris dengan `process_status='failed'` **tidak boleh**
+dihapus pada pembersihan 30 hari. Tujuannya agar data yang gagal diparse tetap
+bisa dipulihkan setelah parser diperbaiki. Arsipkan `body_raw`-nya ke file
+(minio/disk) sebelum dihapus, lalu simpan lokasinya di `error_message`.
+
+Jalankan sebagai job harian di luar jam sibuk, dengan `LIMIT` per batch
+(mis. 5.000 baris) untuk menghindari tabel lock panjang:
+
+```sql
+DELETE FROM iclock_request
+WHERE created_at < NOW() - INTERVAL 30 DAY
+  AND process_status <> 'failed'
+ORDER BY id
+LIMIT 5000;
+```
+
+### 12.2 Kebutuhan penyimpanan sidik jari
+
+Perkiraan kasar (verifikasi dengan menakar blob nyata dari device sebelum
+finalisasi kapasitas):
+
+```
+per device = jumlah_user × template_per_user × ukuran_template
+           = 500 user × 2 jari × ~2–5 KB
+           = ~2–5 MB per device (tanpa overhead InnoDB)
+```
+
+InnoDB menambah overhead; perkirakan **~2× ukuran data mentah**. Untuk 3.200
+slot penuh (kapasitas maksimum X100C), siapkan **~30–60 MB per device**.
+
+**Catatan penting:** template sidik jari adalah **data biometrik pribadi**.
+Perlakukan sebagai data sensitif:
+- Batasi akses ke tabel ini (jangan tampilkan di API umum).
+- Jangan pernah mengirim blob ke client browser.
+- Audit unduhan template.
+- Pertimbangkan enkripsi at-rest di level tabel/kolom.
+- Pastikan ada dasar hukum/consent dari karyawan sesuai regulasi setempat (PDP).
+
+---
+
+## 13. Alur sinkronisasi dua arah
+
+Ini yang perlu dipahami saat mengimplementasikan keputusan "YA, dua arah".
+
+### 13.1 Aturan penyelesaian konflik
+
+| Kondisi | Tindakan |
+|---|---|
+| Hanya ada di server | Push ke device (`pending_push`) |
+| Hanya ada di device | Tarik ke server sebagai master (`pending_pull`) |
+| Keduanya ada, `version` server > device | Push ke device |
+| Keduanya ada, `version` device > server | Tarik dari device, jadikan master |
+| `version` sama, isi **sama** | `in_sync` — tidak ada aksi |
+| `version` sama, isi **berbeda** | `conflict` → catat di `sync_log`, tunggu admin |
+
+**Aturan emas: jangan pernah menimpa data sidik jari secara diam-diam.**
+Template sidik jari sulit direproduksi (karyawan harus datang dan merekam
+ulang). Bila ragu, tandai `conflict` dan minta keputusan manusia — itu jauh
+lebih murah daripada menghapus sidik jari orang.
+
+### 13.2 Bentuk `sync_log` aman yang mencegah banjir log
+
+```sql
+-- Catat hasil sinkronisasi. Lihat §8c: JANGAN catat 'skipped' yang normal.
+INSERT INTO sync_log
+    (device_id, serial_number, direction, entity_type, pin, finger_index,
+     action, outcome, conflict_detail, resolved_by)
+SELECT ?, ?, 'device_to_server', 'finger_template', ?, ?, 'update', 'conflict',
+       'server v3 | device v3 (isi berbeda)', 'manual';
+```
+
+Query untuk menampilkan konflik yang menunggu keputusan admin:
+
+```sql
+SELECT pin, finger_index, conflict_detail, created_at
+FROM sync_log
+WHERE outcome = 'conflict' AND resolved_by = 'none'
+ORDER BY created_at DESC;
+```
+
+---
+
+## 14. Alur perhitungan keterlambatan
+
+`daily_attendance` diisi job terjadwal (mis. tiap 15 menit untuk hari berjalan,
+plus sekali di akhir hari), **bukan** saat punch masuk — supaya satu punch
+tidak memicu perhitungan ulang seluruh hari.
+
+### 14.1 Prinsip
+
+1. Ambil punch dari `attendance_log` untuk `(employee_id, work_date)`.
+2. Tentukan shift yang berlaku dari `shift_assignment` (lihat §14.2).
+3. `first_in` = punch paling awal, `last_out` = paling akhir.
+4. `late_minutes` = selisih `first_in` terhadap `start_time` shift, dikurangi
+   `late_tolerance_min`, dan **tidak boleh negatif** (0 berarti tidak telat).
+5. Bila karyawan tidak masuk sama sekali → `absent`, **kecuali** tanggal itu
+   hari libur (`holiday`) atau bukan hari kerja (`work_days`) atau ada izin → `holiday`/`leave`.
+6. Bila hanya ada satu sisi punch → `incomplete`, **jangan** `absent`.
+
+### 14.2 Mencari shift yang berlaku pada suatu tanggal
+
+```sql
+SELECT s.id AS shift_id, s.name, s.start_time, s.end_time,
+       s.late_tolerance_min, s.is_overnight
+FROM shift_assignment sa
+JOIN shift s ON s.id = sa.shift_id
+WHERE sa.employee_id = ?
+  AND ? BETWEEN sa.effective_from
+            AND COALESCE(sa.effective_to, '9999-12-31')
+  AND s.is_active = 1
+ORDER BY sa.effective_from DESC
+LIMIT 1;
+```
+
+### 14.3 Upsert ke `daily_attendance` (jangan timpa koreksi manual)
+
+```sql
+INSERT INTO daily_attendance
+    (employee_id, work_date, shift_id, first_in, last_out,
+     punch_count, late_minutes, status)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+    first_in       = IF(is_manual = 1, first_in,  VALUES(first_in)),
+    last_out       = IF(is_manual = 1, last_out,  VALUES(last_out)),
+    punch_count    = IF(is_manual = 1, punch_count, VALUES(punch_count)),
+    late_minutes   = IF(is_manual = 1, late_minutes, VALUES(late_minutes)),
+    status         = IF(is_manual = 1, status, VALUES(status)),
+    shift_id       = IF(is_manual = 1, shift_id, VALUES(shift_id)),
+    updated_at     = NOW();
+```
+
+Pola `IF(is_manual = 1, kolom_lama, nilai_baru)` memastikan koreksi admin
+**tidak pernah** ditimpa job otomatis. Ini penting: tanpa itu, koreksi manual
+akan hilang setiap kali job berjalan.
+
+### 14.4 Punch setelah tengah malam pada shift malam
+
+Untuk shift dengan `is_overnight = 1`, punch yang jatuh **setelah tengah malam
+dan sebelum/sama dengan `end_time`** harus dipetakan ke `work_date` **hari
+sebelumnya**.
+
+**Perhatikan operatornya: `<=`, bukan `<`.** Dengan `<`, punch tepat pada jam
+`end_time` (mis. keluar 06:00:00) akan salah tetap di hari kalendernya —
+kesalahan yang sangat mudah terjadi dan sulit terlihat.
+
+```sql
+SELECT a.*,
+       CASE
+         WHEN s.is_overnight = 1
+              AND HOUR(a.punch_at) <= HOUR(s.end_time)   -- '<=' penting
+           THEN DATE(a.punch_at) - INTERVAL 1 DAY
+         ELSE a.punch_date
+       END AS effective_work_date
+FROM attendance_log a
+JOIN shift_assignment sa
+  ON sa.employee_id = a.employee_id
+ AND DATE(a.punch_at) BETWEEN sa.effective_from
+                          AND COALESCE(sa.effective_to, '9999-12-31')
+JOIN shift s ON s.id = sa.shift_id;
+```
+
+**Saran:** jangan andalkan ambang jam saja. Ambang yang lebih kuat adalah
+membandingkan punch dengan batas **`start_time` shift** — punch yang terjadi
+lebih dari beberapa jam *sebelum* `start_time` (mis. sebelum pukul 18:00 untuk
+shift 22:00) hampir pasti milik shift malam **sebelumnya**, sedangkan punch
+setelah `start_time` milik shift hari itu. Ini lebih tahan terhadap shift yang
+tidak bulat jamnya.
+
+Bila aturan ini terlewat, shift malam akan tampak "alpa" setiap hari — bug
+yang sangat terlihat dan sering terjadi.
+
+### 14.5 Menghitung keterlambatan tanpa error underflow
+
+**Jebakan MySQL yang wajib dihindari.** `TIMESTAMPDIFF()` mengembalikan
+**BIGINT UNSIGNED**. Bila hasilnya dikurangi (mis. toleransi) dan menjadi
+negatif, MySQL melempar:
+
+```
+ERROR 1690 (22003): BIGINT UNSIGNED value is out of range
+```
+
+Artinya, query yang tampak benar akan **gagal total untuk setiap karyawan yang
+datang lebih awal**. Jangan pernah menulis `GREATEST(0, timestampdiff(...) - toleransi)`.
+
+**Cara yang benar — balik urutannya, lalu kurangi:**
+
+```sql
+-- late_minutes: keterlambatan setelah toleransi, tidak pernah negatif
+SELECT
+  CASE
+    WHEN a.first_in > ts.scheduled_start
+      THEN GREATEST(0,
+             TIMESTAMPDIFF(MINUTE, ts.scheduled_start, a.first_in)
+             - s.late_tolerance_min)
+    ELSE 0
+  END AS late_minutes
+FROM ...
+```
+
+Kunci pemecahannya: **pastikan hanya dihitung saat benar-benar terlambat**
+(`first_in > scheduled_start`). Setelah syarat itu benar, selisihnya sudah
+pasti non-negatif, sehingga pengurangan toleransi tidak lagi underflow.
+Cabang `ELSE 0` menangani kasus datang lebih awal.
+
+Bila tetap ingin memakai `GREATEST`, ubah tipenya lebih dahulu:
+
+```sql
+GREATEST(0, CAST(TIMESTAMPDIFF(MINUTE, start, actual) AS SIGNED) - tolerance)
+```
+
+Pola yang sama berlaku untuk `early_leave_minutes`.
+
+#### Menggabungkan tanggal dan jam shift menjadi satu titik waktu
+
+`start_time` shift adalah `TIME`, sedangkan punch adalah `DATETIME`. Untuk
+membandingkannya, rakit dulu menjadi `DATETIME` — dan ingat shift malam:
+
+```sql
+-- Untuk shift biasa: tanggal kerja + jam mulai
+TIMESTAMP(da.work_date, s.start_time)
+
+-- Untuk shift malam: titik mulai ada di hari kerja itu,
+-- titik selesai ada di hari BERIKUTNYA
+TIMESTAMP(da.work_date, s.start_time)                          AS scheduled_start
+TIMESTAMP(da.work_date + INTERVAL 1 DAY, s.end_time)           AS scheduled_end
+```
+
+Melewatkan `+ INTERVAL 1 DAY` pada `scheduled_end` akan membuat semua shift
+malam terlihat "pulang sangat awal" (bahkan negatif), yang lalu memicu bug
+underflow di §14.5.
+
+---
+
+## 15. Alur setup device X100C
+
+Ringkasan langkah yang perlu dilakukan di device (dari dokumentasi ZKTeco):
+
+**Prasyarat:** firmware X100C harus sudah punya fitur **PUSH/ADMS**. Bila
+belum, upgrade firmware via USB terlebih dahulu.
+
+Di device:
+
+```
+Menu > Comm > Cloud Server setting
+    Server Address : <IP atau domain server ADMS>
+    Server Port    : <port ADMS>
+```
+
+Pastikan juga:
+
+```
+Menu > Comm > Ethernet
+    IP Address / Subnet Mask / Gateway / DNS  → sesuai jaringan server
+```
+
+Setelah tersimpan, device akan memanggil `GET /iclock/cdata?SN=<SN>` dalam
+waktu beberapa detik hingga satu menit. Device muncul di tabel `device`
+dengan `status='pending'` sampai admin menyetujuinya.
+
+**Uji cepat bahwa server sudah dijangkau device:** cek baris baru di
+`iclock_request` dengan `endpoint='cdata'`. Bila tabel itu tetap kosong,
+masalahnya ada di jaringan/firmware device, **bukan** di kode server.
+
+---

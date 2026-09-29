@@ -25,14 +25,29 @@ docs/                   # dokumen rancangan
   PROTOCOL-SPEC.md      # referensi teknis wire protocol (untuk parser)
   SCHEMA.md             # penjelasan skema database
 migrations/             # skrip migrasi SQL
-  001_init_adms_push.sql
+  001_init_adms_push.sql            # inti protokol push (7 tabel)
+  002_biometric_sync_schedule.sql   # sidik jari, sync 2 arah, shift (6 tabel)
 ```
 
 ## Rencana: ZKTeco iClock / ADMS Push Protocol
 
-ADMS akan menerima absensi langsung dari device ZKTeco (push), di mana
-**device selalu menjadi klien** dan memanggil server kita — tidak perlu ada
-port masuk ke jaringan cabang.
+ADMS akan menerima absensi langsung dari device **ZKTeco X100C** (push), di
+mana **device selalu menjadi klien** dan memanggil server kita — tidak perlu
+ada port masuk ke jaringan cabang.
+
+Keputusan yang sudah ditetapkan:
+
+| Aspek | Keputusan |
+|---|---|
+| Device | ZKTeco **X100C** (fingerprint only) |
+| Template biometrik | **Hanya sidik jari** (tidak ada wajah) |
+| Sinkronisasi user | **Dua arah**, dengan resolusi konflik |
+| Retensi `iclock_request` | **30 hari** |
+| Jadwal shift | **Ya**, untuk hitung keterlambatan |
+
+> **Periksa lebih dulu:** ADMS adalah **fungsi opsional** pada X100C.
+> Pastikan firmware device mendukung PUSH/ADMS sebelum mulai — lihat
+> PRD §0.1.
 
 Baca berurutan:
 
@@ -42,10 +57,11 @@ Baca berurutan:
    dan jebakan yang sudah terverifikasi di perangkat nyata
 3. [`docs/SCHEMA.md`](docs/SCHEMA.md) — rancangan tabel + alasan tiap keputusan
 
-Terapkan skema:
+Terapkan skema (13 tabel):
 
 ```bash
 mysql -u <user> -p <database> < migrations/001_init_adms_push.sql
+mysql -u <user> -p <database> < migrations/002_biometric_sync_schedule.sql
 ```
 
 ## Menjalankan

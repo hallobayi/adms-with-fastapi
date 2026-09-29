@@ -1,10 +1,45 @@
 # PRD — Implementasi ZKTeco iClock / ADMS Push Protocol
 
 **Proyek:** ADMS (Attendance Device Management System)
-**Versi dokumen:** 1.0
+**Versi dokumen:** 2.0
 **Tanggal:** 2026-09-29
-**Status:** Draft untuk implementasi
+**Status:** Siap implementasi — keputusan terbuka sudah dijawab
 **Stack:** FastAPI + MySQL 8 (`app/` yang sudah direfactor)
+
+---
+
+## 0. Keputusan yang sudah ditetapkan
+
+| # | Pertanyaan | Keputusan | Dampak |
+|---|---|---|---|
+| 1 | Model device | **ZKTeco X100C** | Fingerprint saja; varian ATTLOG yang diuji dibatasi ke yang didukung X100C |
+| 2 | Template biometrik | **HANYA sidik jari** | Tambah `finger_template` (BLOB). Tabel face/photo **tidak** dibuat. |
+| 3 | Sinkronisasi user | **DUA ARAH** | Perlu `version` + `sync_state`, tabel `sync_log`, dan aturan konflik eksplisit |
+| 4 | Retensi `iclock_request` | **30 hari** | Job pembersihan + pemadatan `body_raw` bertahap |
+| 5 | Hubungkan ke shift | **YA** | Tambah `shift`, `shift_assignment`, `daily_attendance`, `holiday` |
+
+**Konsekuensi penting dari keputusan #3:** sinkronisasi dua arah sidik jari
+adalah bagian paling berisiko di proyek ini. Template sidik jari tidak bisa
+"diperbaiki" — bila salah menimpa, karyawan harus datang dan merekam ulang.
+Lihat §6 FR-7 dan §5 NFR-6.
+
+Dokumen terkait: `docs/PROTOCOL-SPEC.md` (wire format),
+`docs/SCHEMA.md` (desain tabel), `migrations/` (skrip SQL).
+
+---
+
+## 0.1 Peringatan awal — ADMS adalah fitur OPSIONAL di X100C
+
+Dari lembar spesifikasi X100C, **ADMS dan Webserver tercantum sebagai
+"Optional Functions"**, berbeda dari SMS/Workcode/DST/Scheduled-bell yang
+standar. Ini berarti device yang dibeli belum tentu bisa memakai mode push.
+
+> **Tindakan sebelum fase F1:** pastikan firmware X100C yang ada sudah
+> mendukung PUSH/ADMS. Bila belum, device perlu upgrade firmware via USB.
+> **Seluruh pekerjaan integrasi tidak bisa diuji tanpa ini.**
+
+Ini bukan detail administratif — ini penentu apakah proyek bisa berjalan.
+Sebaiknya diverifikasi dengan satu device contoh sebelum menulis banyak kode.
 
 ---
 
@@ -29,12 +64,17 @@ cukup device bisa menjangkau URL server.
 | G3 | Tidak ada duplikat walau device kirim ulang | 1 punch = 1 baris di `attendance_log` |
 | G4 | Server dapat mengirim perintah ke device | Tambah/hapus user sampai di device < 1 siklus poll |
 | G5 | Data mentah tersimpan untuk audit | Body mentah tiap request tersimpan utuh |
+| G6 | Sidik jari tersinkron dua arah | User yang didaftarkan di satu device bisa verifikasi di device lain |
+| G7 | Keterlambatan dihitung otomatis | `daily_attendance` terisi tanpa intervensi manual |
 
-### 1.2 Non-tujuan (di luar cakupan v1)
+### 1.2 Non-tujuan (di luar cakupan)
 
-- Penarikan template sidik jari / wajah (FINGERTMP, FACE) — ditunda.
+- **Template wajah / face recognition** — keputusan: HANYA sidik jari. X100C
+  memang device fingerprint.
+- **Penarikan foto absensi** (ATTPHOTO / BIOPHOTO) — device tidak memilikinya.
 - Manajemen akses pintu (door control), alarm, dan interlock.
 - Aplikasi web UI penuh untuk manajemen karyawan (hanya API + halaman monitor sederhana).
+- Penggajian (payroll). Sistem ini menghasilkan data kehadiran, bukan slip gaji.
 
 ---
 
@@ -202,11 +242,22 @@ app/
     commands.py                    # kosakata perintah + validasi anti-injection
     service.py                     # orkestrasi: ingest, antrian perintah, dedup
     deps.py                        # dependency auth device
+  biometric/
+    fingerprint.py                 # (de)serialisasi blob template sidik jari
+    sync.py                        # mesin sinkronisasi dua arah + resolusi konflik
+  attendance/
+    calculate.py                   # hitung keterlambatan dari shift
+    schedule.py                    # resolusi shift yang berlaku per tanggal
   models/                          # model SQLAlchemy / skema MySQL
   routers/
     devices.py                     # API internal: kelola device (auth JWT)
     attendance.py                  # API internal: baca absensi
     commands.py                    # API internal: antrikan perintah ke device
+    shifts.py                      # API internal: kelola shift & penugasan
+  jobs/
+    compute_daily.py               # job: attendance_log -> daily_attendance
+    retention.py                   # job: retensi iclock_request 30 hari
+    device_health.py               # job: pantau online + AttLogCount
 ```
 
 **Alasan pemisahan `app/iclock/`:** endpoint ini tidak memakai auth pengguna
@@ -300,9 +351,52 @@ ulang menjadi tidak berbahaya.
 - **FR-6.4** `POST /api/devices/{id}/commands` — antrikan perintah (tervalidasi).
 - **FR-6.5** `POST /api/devices/{id}/commands/query-users` — minta user dari device.
 
----
+### FR-7 Sinkronisasi dua arah sidik jari
+- **FR-7.1** Server dapat mendorong user + template sidik jari ke device
+  (server → device) memakai `DATA UPDATE USERINFO`.
+- **FR-7.2** Server dapat menarik template dari device (device → server) dengan
+  `DATA QUERY USERINFO` lalu membaca push `table=USERINFO` / template.
+- **FR-7.3** Setiap perubahan template menaikkan `version` dan menyetel
+  `sync_state='pending_push'`.
+- **FR-7.4** Aturan konflik (lihat `docs/SCHEMA.md` §13.1):
+  versi lebih tinggi menang; versi sama + isi berbeda → `conflict`,
+  dicatat di `sync_log`, menunggu keputusan admin.
+- **FR-7.5** **Sistem tidak boleh menimpa template sidik jari secara
+  diam-diam.** Ragu = tandai `conflict`.
+- **FR-7.6** Blob template disimpan **byte persis** seperti diterima. Dilarang
+  memotong, mengubah, atau menormalkan isi template.
+- **FR-7.7** `sync_log` hanya mencatat `applied`, `conflict`, dan `failed`.
+  Kejadian `skipped` normal tidak dicatat (hanya dihitung sebagai metrik)
+  agar tabel tidak membanjir.
 
-## 5. Kebutuhan non-fungsional
+### FR-8 Jadwal shift & perhitungan keterlambatan
+- **FR-8.1** Admin dapat mendefinisikan shift (`start_time`, `end_time`,
+  `late_tolerance_min`, `work_days`), termasuk **shift lewat tengah malam**.
+- **FR-8.2** Admin dapat menugaskan shift ke karyawan per rentang tanggal.
+- **FR-8.3** Job terjadwal mengolah `attendance_log` → `daily_attendance`
+  dengan `first_in`, `last_out`, `late_minutes`, `overtime_minutes`, `status`.
+- **FR-8.4** Punch setelah tengah malam pada shift malam dipetakan ke
+  `work_date` **hari sebelumnya** (bukan hari kalender).
+- **FR-8.5** Punch tidak lengkap (hanya masuk tanpa keluar) → status
+  `incomplete`, **bukan** `absent` dan **bukan** `present`.
+- **FR-8.6** Hari libur (`holiday`) dan hari non-kerja (`work_days`) tidak
+  dihitung alpa.
+- **FR-8.7** `late_minutes` tidak pernah negatif; toleransi dikurangi lebih dulu.
+- **FR-8.8** Koreksi manual admin (`is_manual=1`) **tidak boleh** ditimpa job
+  otomatis.
+- **FR-8.9** Job perhitungan bersifat **idempoten** — dijalankan berulang kali
+  menghasilkan hasil sama, aman diulang.
+
+### FR-9 Retensi data
+- **FR-9.1** `body_raw` pada `iclock_request` > 7 hari dipadatkan (di-NULL-kan),
+  kecuali baris `failed` dan `USERINFO`.
+- **FR-9.2** `iclock_request` > 30 hari dihapus, **kecuali**
+  `process_status='failed'` (itu yang nanti perlu diproses ulang).
+- **FR-9.3** Penghapusan berjalan per batch (`LIMIT 5000`) agar tidak mengunci
+  tabel.
+- **FR-9.4** Request `failed` diarsipkan ke storage sebelum dihapus pada 90 hari.
+
+---
 
 ### NFR-1 Performa
 - Respons `/iclock/*` < 200 ms (p95). Device memakai timeout pendek.
@@ -335,9 +429,29 @@ ulang menjadi tidak berbahaya.
 - Endpoint `GET /health` yang sudah ada diperluas dengan status antrian perintah.
 
 ### NFR-5 Kompatibilitas
-- Wajib diuji terhadap varian ATTLOG A, B, dan C.
+- Wajib diuji terhadap varian ATTLOG yang benar-benar dikirim **X100C**.
 - Wajib benar terhadap device yang mengirim ulang setelah jaringan pulih.
 - Balasan handshake memakai **CRLF**; ini pernah jadi penyebab device diam.
+- Handshake menyertakan `TimeZone=7` untuk WIB (dipakai referensi implementasi
+  X100-C). **Jadikan ini konfigurasi**, bukan hardcode — server bisa dipakai
+  di zona waktu lain, dan `TimeZone` yang salah akan menggeser jam device.
+
+### NFR-6 Keamanan data biometrik
+Template sidik jari adalah **data pribadi sensitif** dan tidak bisa diganti
+seperti password.
+- Tabel `finger_template` **tidak** boleh terekspos di API publik.
+- Blob template **tidak pernah** dikirim ke browser/client.
+- Akses baca blob wajib dicatat (audit).
+- Pertimbangkan enkripsi at-rest.
+- Sediakan mekanisme hapus permanen saat karyawan berhenti (hak penghapusan
+  data sesuai regulasi PDP).
+
+### NFR-7 Kapasitas device X100C
+- Kapasitas log device **100.000 record**. Bila penuh sebelum tersinkron,
+  punch lama **terhapus di device dan hilang permanen**.
+- Sistem **wajib** memantau `AttLogCount` (via `GET OPTION`) dan memberi
+  peringatan pada ambang tertentu (mis. 70%).
+- Kapasitas sidik jari 3.200 slot; pantau `UserCount`/`FPCount`.
 
 ---
 
@@ -356,6 +470,18 @@ ulang menjadi tidak berbahaya.
 | AC-9 | Nama user berisi `\n` | Ditolak di validasi, tidak masuk antrian |
 | AC-10 | DB mati saat ingest | Body tersimpan di darurat, device tetap dapat `OK` |
 | AC-11 | Operlog masuk | Tersimpan, `table='OPERLOG'`, tidak muncul di daftar absensi |
+| AC-12 | Satu PIN, dua slot jari berbeda | **Dua** baris `finger_template` tersimpan |
+| AC-13 | Slot jari sama untuk PIN sama dua kali | Ditolak `uk_finger_slot` (duplikat dicegah) |
+| AC-14 | Template diubah ulang | `version` naik, `sync_state='pending_push'` |
+| AC-15 | Versi sama, isi berbeda | `sync_state='conflict'`, tercatat di `sync_log` |
+| AC-16 | Hapus shift yang masih ditugaskan | **Ditolak** (`RESTRICT`), shift tetap ada |
+| AC-17 | Job hitung ulang jalan dua kali | Hasil sama, tidak ada baris ganda di `daily_attendance` |
+| AC-18 | Koreksi manual lalu job jalan | Nilai manual **tidak** tertimpa |
+| AC-19 | Shift malam 22:00–06:00, punch 02:00 | Masuk `work_date` hari sebelumnya |
+| AC-20 | Punch hanya masuk tanpa keluar | `status='incomplete'`, bukan `absent` |
+| AC-21 | Tanggal hari libur | Tidak ada `absent`; status `holiday` |
+| AC-22 | Karyawan telat 5 menit, toleransi 10 | `late_minutes = 0` (tidak negatif) |
+| AC-23 | Pembersihan retensi | `failed` **tidak** terhapus; `body_raw` lama dipadatkan |
 
 ---
 
@@ -363,13 +489,19 @@ ulang menjadi tidak berbahaya.
 
 | Fase | Isi | Definisi selesai |
 |---|---|---|
-| **F1** | Migrasi skema DB (§4 dokumen skema) | Migrasi jalan naik & turun bersih |
+| **F0** | Verifikasi firmware X100C mendukung PUSH/ADMS | Satu device benar-benar memanggil server kita |
+| **F1** | Migrasi skema DB (001 + 002) | Kedua migrasi jalan bersih, 13 tabel terbentuk |
 | **F2** | Handshake + registrasi device (FR-1) | AC-1 lulus, device nyata dapat konfigurasi |
-| **F3** | Parser + ingest ATTLOG (FR-2) | AC-2, AC-3, AC-4, AC-11 lulus |
+| **F3** | Parser + ingest ATTLOG (FR-2) | AC-2, AC-3, AC-11 lulus |
 | **F4** | Antrian & perintah (FR-4, FR-5) | AC-5..AC-9 lulus |
 | **F5** | API internal (FR-6) | Device bisa disetujui & dipantau |
-| **F6** | Sinkronisasi user (FR-3) | AC-5 mencakup USERINFO |
-| **F7** | Pengerasan + observabilitas (NFR) | AC-10 lulus, metrik terlihat |
+| **F6** | Sinkronisasi user + sidik jari (FR-3, FR-7) | AC-12..AC-15, AC-5 lulus |
+| **F7** | Jadwal shift & perhitungan (FR-8) | AC-16..AC-22 lulus |
+| **F8** | Pengerasan, retensi, observabilitas (FR-9, NFR) | AC-10, AC-23 lulus, metrik terlihat |
+
+**F0 adalah gerbang wajib.** Bila firmware X100C tidak mendukung PUSH/ADMS,
+F1–F8 tidak ada gunanya karena tidak akan ada data yang masuk. Selesaikan F0
+lebih dulu, dengan satu device nyata.
 
 **F2 dan F3 adalah jalur kritis** — tanpa keduanya tidak ada data yang masuk.
 
@@ -379,24 +511,37 @@ ulang menjadi tidak berbahaya.
 
 | Risiko | Dampak | Mitigasi |
 |---|---|---|
+| **Firmware X100C tidak punya ADMS** | Proyek tidak bisa jalan sama sekali | **F0: verifikasi lebih dulu** dengan device nyata; siapkan firmware upgrade |
 | Firmware berbeda-beda perilakunya | Parser gagal di sebagian device | Simpan data mentah; parser multi-varian; uji dengan device nyata |
 | Device mengirim ulang tanpa henti | Tabel membengkak | UNIQUE hash + balas `OK` selalu |
 | URL statis membocorkan token | Device lain bisa menyuntik data | Token per device, rotasi token, pantau SN tak dikenal |
 | `Shell` disalahgunakan | Device rusak permanen | Nonaktif default, butuh flag eksplisit + audit |
-| Zona waktu salah | Absensi bergeser | Jangan kirim `TimeZone`; simpan UTC + offset device |
+| Zona waktu salah | Absensi bergeser | `TimeZone` jadi konfigurasi; simpan UTC + offset device |
 | Jam device tidak akurat | Punch tercatat di waktu salah | Sediakan sinkronisasi waktu opsional, jangan paksa |
+| **Template sidik jari tertimpa salah saat sync 2 arah** | Karyawan harus rekam ulang; data hilang permanen | Versi + `sync_state`; ragu → `conflict`; jangan pernah timpa diam-diam |
+| **Log device X100C penuh (100.000)** | Punch lama hilang permanen di device | Pantau `AttLogCount`, peringatan di 70%, ambil log berkala |
+| **Salah urai format template** | Blob rusak, tidak bisa dipulihkan | Simpan byte mentah; jangan parse/ubah; verifikasi dengan round-trip ke device |
+| Shift malam salah dipetakan | Semua karyawan shift malam "alpa" | Aturan `effective_work_date`; AC-19 wajib lulus |
+| Koreksi manual tertimpa job | Data kehadiran salah, kepercayaan hilang | `is_manual` + pola `IF(is_manual=1, ...)`; AC-18 wajib lulus |
+| Data biometrik bocor | Pelanggaran privasi / regulasi | Blob tidak keluar API; audit akses; enkripsi at-rest |
 
 ---
 
-## 9. Pertanyaan terbuka
+## 9. Pertanyaan terbuka (sisa)
 
-1. **Model device apa saja** yang akan dipakai? Ini menentukan varian ATTLOG
-   yang perlu diuji dan kapabilitas yang tersedia.
-2. Apakah perlu penarikan **template wajah** (FINGERTMP/BIOPHOTO)? Berdampak
-   besar pada kebutuhan penyimpanan.
-3. Perlukah **sinkronisasi dua arah** user (server → device dan device → server
-   saling menimpa), atau satu arah saja?
-4. Berapa **retensi** `iclock_request`? Tabel ini tumbuh paling cepat — usul
-   awal 30 hari, lalu body mentah dipadatkan.
-5. Apakah absensi perlu dihubungkan ke **jadwal shift** untuk menghitung
-   keterlambatan, atau cukup menyimpan punch mentah dulu?
+Keputusan #1–#5 sudah dijawab dan sudah tercermin di dokumen ini serta skema.
+Yang masih perlu dijawab **saat implementasi berjalan**:
+
+1. **Apakah X100C yang ada sudah ber-firmware ADMS?** (paling mendesak —
+   lihat F0)
+2. **Berapa banyak user per device, dan berapa slot jari per user?**
+   Menentukan kebutuhan penyimpanan `finger_template` (perkiraan kasar:
+   ~30–60 MB/device bila penuh).
+3. **Aturan konflik sync yang mana yang dipakai default** — `server_wins`,
+   `device_wins`, atau selalu `manual`? Disarankan **`manual`** untuk sidik
+   jari, karena taruhannya karyawan harus rekam ulang.
+4. **Perlu sinkronisasi waktu otomatis ke device?** Bila device jarang
+   disetel dan jamnya melenceng, semua absensi bergeser. Bisa dipakai
+   `Shell date` atau `TimeZone`, tetapi keduanya punya efek samping.
+5. **Di mana template sidik jari diarsipkan** bila jumlah device bertambah —
+   tetap di MySQL atau pindah ke object storage?

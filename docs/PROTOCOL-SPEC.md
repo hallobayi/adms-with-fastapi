@@ -6,6 +6,49 @@ implementasi server lain. Dokumen ini adalah rujukan saat menulis parser.
 
 ---
 
+## 0. Device target: ZKTeco X100C
+
+**Penting:** ADMS adalah **fungsi opsional** pada X100C. Verifikasi firmware
+sebelum memulai (lihat PRD §0.1).
+
+| Item | Nilai | Relevansi |
+|---|---|---|
+| Kapasitas sidik jari | 3.200 | Batas jumlah slot user |
+| Kapasitas log | 100.000 | **Bila penuh, punch lama terhapus di device** |
+| Komunikasi | TCP/IP, USB | Push lewat TCP/IP |
+| Verifikasi | Fingerprint, PIN, kartu RFID (opsional) | Tidak ada wajah |
+| Display | 3 inci | — |
+| Zona waktu | `TimeZone=7` (WIB) | Jadikan konfigurasi |
+
+### 0.1 Yang dikonfirmasi berjalan di X100-C
+
+Dari implementasi referensi yang diuji pada X100-C:
+
+- ✅ Handshake `GET /iclock/cdata?SN=` → balasan `GET OPTION FROM: ...` CRLF
+- ✅ `POST /iclock/cdata?table=ATTLOG` dengan body tab-separated
+- ✅ Balasan `OK: <jumlah>` diterima device
+- ✅ `GET /iclock/getrequest` → device menerima `OK` saat tidak ada perintah
+- ✅ `TransFlag=1111000000`, `Realtime=1`, `Stamp=9999`, `Delay=30`,
+  `ErrorDelay=60`
+- ✅ `TimeZone=7` dipakai (dikomentari di referensi, jadi opsional)
+
+### 0.2 Yang **belum** terkonfirmasi untuk X100C
+
+- ⚠️ **Format blob template sidik jari.** Referensi X100-C tidak menguraikan
+  struktur template sama sekali — hanya menyimpan body mentah. Header 6 byte
+  (`size`/`uid`/`finger_id`/`flag`) berasal dari keluarga ZKTeco lain dan
+  **belum tentu** berlaku di X100C.
+  → **Jangan bangun logika pada asumsi format.** Simpan blob apa adanya, dan
+  verifikasi dengan uji round-trip (tarik → kirim ulang → cek verifikasi di
+  device).
+- ⚠️ Perintah untuk mengirim template **ke** device pada X100C belum
+  diverifikasi. Perlu diuji langsung.
+- ⚠️ Varian ATTLOG yang benar-benar dipakai X100C. Referensi menunjukkan
+  pemisahan **tab** dengan minimal 6 kolom (`employee_id`, `timestamp`,
+  `status1`..`status5`), konsisten dengan Varian B di bawah.
+
+---
+
 ## 1. Endpoint
 
 | Path | Method | Auth | Fungsi |
@@ -59,9 +102,38 @@ Encrypt=0\r\n
 | `TransFlag` | 10 digit | Bitmask tabel yang dikirim |
 | `Realtime` | `1`/`0` | Kirim punch segera |
 | `Encrypt` | `0` | Nonaktifkan enkripsi |
-| `TimeZone` | menit | **Hindari** — menggeser jam device |
+| `TimeZone` | menit | **Konfigurasi**, jangan hardcode. `420` = WIB (UTC+7). Menggeser jam device. |
 
-### TransFlag (10 digit, urut kiri ke kanan)
+### 2.1 Handshake yang dikonfirmasi di X100-C
+
+Blok ini sudah terbukti diterima X100-C (dengan `TimeZone=7` sebagai opsi;
+referensi aslinya mengomentari baris itu, jadi device tetap jalan tanpanya):
+
+```
+GET OPTION FROM: <SN>\r\n
+Stamp=9999\r\n
+OpStamp=<unix_ts>\r\n
+ErrorDelay=60\r\n
+Delay=30\r\n
+ResLogDay=18250\r\n
+ResLogDelCount=10000\r\n
+ResLogCount=50000\r\n
+TransTimes=00:00;14:05\r\n
+TransInterval=1\r\n
+TransFlag=1111000000\r\n
+TimeZone=7\r\n
+Realtime=1\r\n
+Encrypt=0
+```
+
+**Catatan tentang `TimeZone`:** referensi memakai `TimeZone=7` untuk WIB, tapi
+nilai ini **bukan** offset menit standar — beberapa firmware menerimanya
+sebagai jam, yang lain sebagai menit. Karena efeknya menggeser jam device,
+kirim hanya bila memang ingin menyetel waktu device, dan **verifikasi
+hasilnya** dengan membandingkan `punch_at` device vs jam nyata sebelum
+mengaktifkannya di produksi.
+
+### 2.2 TransFlag (10 digit, urut kiri ke kanan)
 ```
 1 1 1 1 0 0 0 0 0 0
 │ │ │ │ └─┴─┴─┴─┴── reserved
@@ -216,8 +288,77 @@ Bisa **banyak baris** dalam satu POST. Balasan server: `OK`.
 
 ---
 
-## 6. Referensi
+## 6. Setup device X100C
+
+Dari dokumentasi resmi ZKTeco. **Prasyarat:** firmware sudah punya fitur
+PUSH/ADMS (fungsi opsional pada X100C — lihat PRD §0.1).
+
+```
+Menu > Comm > Cloud Server setting
+    Server Address : <IP atau domain server ADMS>
+    Server Port    : <port ADMS>
+```
+
+Pastikan jaringan device benar:
+
+```
+Menu > Comm > Ethernet
+    IP Address / Subnet Mask / Gateway / DNS  → sesuai jaringan server
+```
+
+Setelah disimpan, device memanggil `GET /iclock/cdata?SN=<SN>` dalam beberapa
+detik hingga satu menit.
+
+**Cara membuktikan device benar-benar terhubung:** periksa baris baru di tabel
+`iclock_request` dengan `endpoint='cdata'`. Kalau tabel itu tetap kosong,
+masalahnya ada di **jaringan atau firmware device — bukan di kode server**.
+Ini langkah diagnosis pertama yang paling berguna, dan menghemat waktu
+sebelum mulai mencurigai parser.
+
+---
+
+## 7. Template sidik jari — status pengetahuan
+
+### 7.1 Yang diketahui
+
+- Device ZKTeco mendukung hingga **10 slot jari per user** (indeks 0–9).
+- Sebagian keluarga ZKTeco memakai **header 6 byte**: offset 0–1 = ukuran
+  (little-endian), 2–3 = UID (little-endian), 4 = finger ID, 5 = flag.
+- Blob template bersifat biner dan **tidak** dikirim sebagai teks.
+
+### 7.2 Yang **tidak** diketahui untuk X100C
+
+- Apakah header 6 byte itu berlaku. Implementasi referensi X100-C **tidak**
+  menguraikan template — hanya menyimpan body mentah.
+- Perintah tepat untuk mengirim template **ke** X100C.
+- Ukuran pasti satu template pada X100C.
+
+### 7.3 Aturan yang harus dipatuhi
+
+> **Simpan blob template byte persis seperti diterima. Jangan memotong,
+> mengubah, atau menormalkan.**
+
+Alasannya: template sidik jari tidak bisa direkonstruksi. Bila blob rusak
+karena kita "membantu" menafsirkannya, satu-satunya jalan keluar adalah
+memanggil karyawan untuk merekam ulang. Menyimpan byte mentah selalu aman.
+
+### 7.4 Cara memverifikasi tanpa tahu formatnya
+
+Tidak perlu memahami struktur template untuk membuktikan implementasi benar:
+
+1. Tarik template dari device → simpan blob.
+2. Kirim blob itu kembali ke device **tanpa perubahan apa pun**.
+3. Coba verifikasi sidik jari user tersebut di device.
+
+Bila langkah 3 berhasil, format sudah benar. Ini uji round-trip, dan jauh
+lebih dapat diandalkan daripada menebak layout byte.
+
+---
+
+## 8. Referensi
 
 - `s0x90/zkteco-adms` — library Go, detail perintah diverifikasi di perangkat keras
+- `saifulcoder/adms-server-ZKTeco` — implementasi Laravel, **diuji pada X100-C**
+- Dokumentasi ZKTeco: ADMS Settings on the device (Menu > Comm > Cloud Server)
 - Spesifikasi ZKTeco PUSH SDK v2.3 / v3.1.2 (dokumen resmi, catatan: sebagian
   sintaks di dokumen sudah usang)
