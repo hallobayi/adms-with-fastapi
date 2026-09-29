@@ -39,15 +39,21 @@ Keputusan yang sudah ditetapkan:
 
 | Aspek | Keputusan |
 |---|---|
-| Device | ZKTeco **X100C** (fingerprint only) |
-| Template biometrik | **Hanya sidik jari** (tidak ada wajah) |
-| Sinkronisasi user | **Dua arah**, dengan resolusi konflik |
+| Device | ZKTeco **X100C** (fingerprint only); **firmware ADMS sudah tersedia** |
+| Template biometrik | **Hanya sidik jari**, **2–4 jari per user** |
+| Sinkronisasi user | **Dua arah**; konflik **selalu ditinjau manual** (tidak pernah ditimpa otomatis) |
+| Sinkronisasi waktu | **TimeZone** per device (`tz_name`), diterapkan **saat parse** |
+| Lokasi arsip template | **Object storage** — MySQL hanya menyimpan metadata |
 | Retensi `iclock_request` | **30 hari** |
 | Jadwal shift | **Ya**, untuk hitung keterlambatan |
 
-> **Periksa lebih dulu:** ADMS adalah **fungsi opsional** pada X100C.
-> Pastikan firmware device mendukung PUSH/ADMS sebelum mulai — lihat
-> PRD §0.1.
+> **Catatan:** ADMS adalah **fungsi opsional** pada X100C. Pemangku kepentingan
+> sudah mengonfirmasi firmware yang dipakai mendukungnya, tetapi verifikasi
+> ulang per unit baru — lihat PRD §0.3.
+
+> **Prasyarat zona waktu:** bila memakai `CONVERT_TZ()` di MySQL, tabel zona
+> waktu harus dimuat dulu, jika tidak hasilnya `NULL` (bukan error). Lihat
+> SCHEMA §16.1b. Disarankan konversi tz di lapisan aplikasi (`zoneinfo`).
 
 Baca berurutan:
 
@@ -56,6 +62,7 @@ Baca berurutan:
 2. [`docs/PROTOCOL-SPEC.md`](docs/PROTOCOL-SPEC.md) — format wire, perintah,
    dan jebakan yang sudah terverifikasi di perangkat nyata
 3. [`docs/SCHEMA.md`](docs/SCHEMA.md) — rancangan tabel + alasan tiap keputusan
+   (§8b object storage, §13 konflik manual, §16 zona waktu)
 
 Terapkan skema (13 tabel):
 
@@ -63,6 +70,9 @@ Terapkan skema (13 tabel):
 mysql -u <user> -p <database> < migrations/001_init_adms_push.sql
 mysql -u <user> -p <database> < migrations/002_biometric_sync_schedule.sql
 ```
+
+Skema sudah diverifikasi terhadap **MySQL 8.0.15** nyata: kedua migrasi jalan
+bersih dan 13 tabel terbentuk.
 
 ## Menjalankan
 

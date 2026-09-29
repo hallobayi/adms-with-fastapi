@@ -2,9 +2,10 @@
 -- Migrasi 002 — Template sidik jari, sinkronisasi dua arah, & jadwal shift
 --
 -- Melengkapi 001_init_adms_push.sql berdasarkan keputusan pemangku kepentingan:
---   * Device: ZKTeco X100C (fingerprint only)
---   * Template sidik jari WAJIB ditarik (bukan wajah)
---   * Sinkronisasi user DUA ARAH
+--   * Device: ZKTeco X100C (fingerprint only), firmware ADMS tersedia
+--   * 2-4 jari per user; template sidik jari disimpan di OBJECT STORAGE
+--   * Sinkronisasi user DUA ARAH; konflik SELALU MANUAL (tidak ada auto-overwrite)
+--   * Sinkronisasi waktu via TimeZone (lihat 001: device.tz_name)
 --   * Retensi iclock_request 30 hari
 --   * Absensi dihubungkan ke jadwal shift
 --
@@ -15,21 +16,51 @@
 SET NAMES utf8mb4;
 
 -- -----------------------------------------------------------------------------
--- 8. finger_template — template sidik jari (BLOB)
+-- 8. finger_template — METADATA template sidik jari (blob di object storage)
+--
+-- Keputusan #5: blob TIDAK lagi disimpan di MySQL (dulu MEDIUMBLOB). Yang
+-- disimpan di sini hanya metadata kecil; byte-nya ada di object storage.
+-- Keuntungan: backup MySQL kecil, buffer pool bersih, replikasi ringan,
+-- dan blob dingin bisa dipindah ke storage yang lebih murah.
+--
+-- Blob disimpan BYTE PERSIS seperti dikirim device (format ZKTeco tidak
+-- terdokumentasi resmi) — jangan pernah dipotong/dinormalkan.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS finger_template (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     employee_id   BIGINT UNSIGNED NULL COMMENT 'NULL bila PIN belum dipetakan',
     device_id     BIGINT UNSIGNED NULL
                   COMMENT 'NULL = template master (milik server), bukan salinan device',
+    -- Kolom bayangan untuk UNIQUE. MySQL menganggap setiap NULL berbeda, jadi
+    -- UNIQUE (pin, finger_index, device_id) TIDAK mencegah dua baris "master"
+    -- (device_id NULL) untuk slot yang sama. Sudah diuji: dua INSERT dengan
+    -- device_id NULL untuk (pin,finger_index) sama sama-sama diterima.
+    -- Solusi: petakan NULL -> 0 pada kolom generated, lalu UNIQUE di atasnya.
+    -- WAJIB VIRTUAL, bukan STORED: pada MySQL 8.0.15 kolom STORED bersama
+    -- foreign key gagal dibuat dengan ERROR 1215 "Cannot add foreign key
+    -- constraint". Sudah diuji — VIRTUAL berhasil, STORED gagal.
+    device_scope  BIGINT UNSIGNED AS (IFNULL(device_id, 0)) VIRTUAL
+                  COMMENT 'device_id dengan NULL->0; hanya untuk UNIQUE (jangan dibaca aplikasi)',
     pin           VARCHAR(24)     NOT NULL,
-    finger_index  TINYINT UNSIGNED NOT NULL COMMENT 'Slot jari 0-9',
-    template_data MEDIUMBLOB      NOT NULL COMMENT 'Blob template mentah dari device',
-    template_size INT UNSIGNED    NOT NULL COMMENT 'Ukuran menurut header 2 byte pertama',
+    finger_index  TINYINT UNSIGNED NOT NULL COMMENT 'Slot jari 0-4 (2-4 jari/user)',
+
+    -- === Blob TIDAK di sini; ini hanya penunjuk + metadata ke object storage ===
+    object_bucket VARCHAR(64)     NULL COMMENT 'Nama bucket/container',
+    object_key    VARCHAR(512)    NULL COMMENT 'Path objek; NULL selama upload belum sukses',
+    template_sha256 CHAR(64)      NULL
+                  COMMENT 'SHA-256 byte template; kunci idempotensi & deteksi drift. TIDAK unik: master & salinan device boleh berbagi satu objek',
+    content_type  VARCHAR(64)     NULL COMMENT 'mis. application/octet-stream',
+    byte_size     INT UNSIGNED    NULL COMMENT 'Ukuran byte blob yang diunggah',
+    upload_state  ENUM('pending','stored','failed') NOT NULL DEFAULT 'pending'
+                  COMMENT 'pending = baris ada, objek belum terunggah',
+    upload_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    uploaded_at   DATETIME        NULL,
+
     version       INT UNSIGNED    NOT NULL DEFAULT 1
-                  COMMENT 'Naik setiap template berubah; dipakai resolusi konflik',
+                  COMMENT 'Naik tiap perubahan; HANYA informasional (konflik selalu manual)',
     quality_score TINYINT UNSIGNED NULL COMMENT 'Perkiraan kualitas dari heuristik byte',
-    is_valid      TINYINT(1)      NOT NULL DEFAULT 1,
+    is_valid      TINYINT(1)      NOT NULL DEFAULT 1
+                  COMMENT '0 = kalah konflik / tidak berlaku. JANGAN hapus baris; ini jejak audit',
     source        ENUM('device','server_import') NOT NULL DEFAULT 'device',
     sync_state    ENUM('in_sync','pending_push','pending_pull','conflict','failed')
                   NOT NULL DEFAULT 'in_sync',
@@ -40,18 +71,30 @@ CREATE TABLE IF NOT EXISTS finger_template (
                                   ON UPDATE CURRENT_TIMESTAMP,
 
     PRIMARY KEY (id),
-    -- Satu slot jari untuk satu PIN per device (dan satu master per PIN bila device_id NULL)
-    UNIQUE KEY uk_finger_slot (pin, finger_index, device_id),
+    -- Satu slot jari untuk satu PIN per device. Memakai device_scope (bukan
+    -- device_id) supaya baris master (device_id NULL) juga unik per slot.
+    UNIQUE KEY uk_finger_slot (pin, finger_index, device_scope),
+    KEY idx_finger_sha (template_sha256),
     KEY idx_finger_employee (employee_id),
     KEY idx_finger_device (device_id),
     KEY idx_finger_sync (sync_state),
+    KEY idx_finger_upload (upload_state),
 
     CONSTRAINT fk_finger_employee FOREIGN KEY (employee_id)
         REFERENCES employee (id) ON DELETE SET NULL,
     CONSTRAINT fk_finger_device FOREIGN KEY (device_id)
-        REFERENCES device (id) ON DELETE CASCADE
+        REFERENCES device (id) ON DELETE CASCADE,
+    -- CATATAN: CHECK BELUM DITEGAKKAN di MySQL 8.0.15 (hanya dienforce sejak
+    -- 8.0.16). Sudah diuji: baris 'stored' tanpa object_key tetap diterima.
+    -- Karena itu CHECK ini hanya dokumentasi + pengaman bila kelak di-upgrade.
+    -- Validasi "stored wajib punya object_key + sha256" WAJIB dilakukan juga
+    -- di lapisan aplikasi; jangan bergantung pada DB.
+    CONSTRAINT ck_finger_stored CHECK (
+        upload_state <> 'stored'
+        OR (object_key IS NOT NULL AND template_sha256 IS NOT NULL)
+    )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  COMMENT='Template sidik jari per PIN dan slot jari';
+  COMMENT='Metadata template sidik jari; blob ada di object storage';
 
 -- -----------------------------------------------------------------------------
 -- 9. sync_log — jejak setiap pertukaran data dua arah (server <-> device)
@@ -68,6 +111,8 @@ CREATE TABLE IF NOT EXISTS sync_log (
     outcome       ENUM('applied','skipped','conflict','failed') NOT NULL,
     conflict_detail VARCHAR(255)  NULL
                   COMMENT 'Diisi bila outcome=conflict: nilai server vs device',
+    -- server_wins/device_wins hanya untuk membaca log lama; alur baru TIDAK
+    -- PERNAH menulisnya (keputusan #3: konflik selalu manual).
     resolved_by   ENUM('server_wins','device_wins','manual','none')
                   NOT NULL DEFAULT 'none',
     command_id    BIGINT UNSIGNED NULL COMMENT 'Perintah yang memicunya, bila ada',

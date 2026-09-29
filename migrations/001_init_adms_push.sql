@@ -9,6 +9,28 @@ SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- -----------------------------------------------------------------------------
+-- PRASYARAT ZONA WAKTU — JANGAN DILEWATI.
+--
+-- Skema ini menyimpan punch dalam UTC dan memakai nama zona IANA
+-- (mis. 'Asia/Jakarta'). Bila tabel zona waktu MySQL belum dimuat,
+-- CONVERT_TZ('2026-09-29 06:00:00','Asia/Jakarta','UTC') mengembalikan NULL
+-- — dan NULL akan masuk ke kolom punch_at. Sudah diuji: pada instalasi bersih
+-- mysql.time_zone_name berisi 0 baris dan CONVERT_TZ mengembalikan NULL.
+--
+-- Muat sekali per server (Linux/macOS):
+--     mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+-- Windows: jalankan mysql_tzinfo_to_sql terhadap direktori tzdata, atau impor
+-- skrip zona yang disediakan paket MySQL.
+--
+-- Verifikasi wajib (harus mengembalikan 2026-09-28 23:00:00, bukan NULL):
+--     SELECT CONVERT_TZ('2026-09-29 06:00:00','Asia/Jakarta','UTC');
+--
+-- Bila memakai Windows dan tidak bisa memuat tzdata, alternatifnya: konversi
+-- tz di lapisan aplikasi (Python zoneinfo) dan kirim UTC langsung ke MySQL.
+-- JANGAN memakai CONVERT_TZ tanpa memastikan tabel zona sudah dimuat.
+-- -----------------------------------------------------------------------------
+
+-- -----------------------------------------------------------------------------
 -- 1. device — device ZKTeco yang terhubung
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS device (
@@ -29,6 +51,15 @@ CREATE TABLE IF NOT EXISTS device (
     trans_flag        CHAR(10)        NOT NULL DEFAULT '1111000000' COMMENT 'TransFlag=',
     realtime          TINYINT(1)      NOT NULL DEFAULT 1 COMMENT 'Realtime=',
     stamp_version     INT UNSIGNED    NOT NULL DEFAULT 9999 COMMENT 'Stamp=',
+
+    -- Zona waktu (keputusan #4). Device mengirim WAKTU DINDING LOKAL, jadi tz
+    -- harus diterapkan saat PARSE, bukan hanya dikirim di handshake.
+    -- Lihat docs/SCHEMA.md §16.
+    tz_name           VARCHAR(64)     NOT NULL DEFAULT 'Asia/Jakarta'
+                      COMMENT 'Zona IANA; SUMBER KEBENARAN untuk parse ATTLOG',
+    tz_offset_minutes SMALLINT        NULL
+                      COMMENT 'Cache offset menit dari tz_name; boleh dihitung ulang',
+    last_tz_sync_at   DATETIME        NULL,
 
     supports_userinfo TINYINT(1)      NOT NULL DEFAULT 1,
     supports_operlog  TINYINT(1)      NOT NULL DEFAULT 1,
@@ -127,16 +158,27 @@ CREATE TABLE IF NOT EXISTS attendance_log (
     pin               VARCHAR(24)     NOT NULL,
     employee_id       BIGINT UNSIGNED NULL COMMENT 'NULL bila PIN tidak dikenal',
 
-    punch_at          DATETIME        NOT NULL COMMENT 'Waktu scan menurut DEVICE',
-    punch_date        DATE            NOT NULL,
-    device_tz_offset  SMALLINT        NULL,
+    -- Waktu. Device mengirim waktu DINDING LOKAL (mis. '2026-09-29 08:15:03'),
+    -- tanpa penanda zona. Karena itu kita simpan KEDUANYA:
+    --   punch_at       = hasil konversi ke UTC (titik waktu tunggal, tak ambigu)
+    --   punch_at_local = kata device apa adanya (untuk audit)
+    --   tz_applied     = zona yang dipakai saat parse (jejak; bisa dihitung ulang)
+    -- Lihat docs/SCHEMA.md §16.
+    punch_at          DATETIME        NOT NULL COMMENT 'Titik waktu TERNORMALISASI ke UTC',
+    punch_at_local    DATETIME        NOT NULL COMMENT 'Waktu dinding persis seperti dikirim device',
+    tz_applied        VARCHAR(64)     NOT NULL COMMENT 'Zona IANA yang dipakai saat parse',
+    punch_date        DATE            NOT NULL
+                      COMMENT 'Tanggal LOKAL device (punch_at_local::DATE), bukan UTC',
 
     status_code       TINYINT         NULL COMMENT '0=in 1=out 2=break_out 3=break_in 4=ot_in 5=ot_out',
     verify_mode       TINYINT         NULL COMMENT '1=fingerprint 4=card 15=face 25=palm',
     work_code         INT             NULL,
     reserved_fields   JSON            NULL,
 
-    record_hash       CHAR(40)        NOT NULL COMMENT 'SHA1(device|pin|punch_at|status|verify|work_code)',
+    -- Hash memakai punch_at_local (BUKAN punch_at): bila admin kelak memperbaiki
+    -- tz_name, hash tetap stabil sehingga absensi lama tidak tergandakan.
+    record_hash       CHAR(40)        NOT NULL
+                      COMMENT 'SHA1(serial|pin|punch_at_local|status|verify|work_code)',
     raw_line          VARCHAR(512)    NOT NULL,
     format_variant    ENUM('positional5','positionalN','keyvalue') NOT NULL,
     parse_status      ENUM('ok','partial','failed') NOT NULL DEFAULT 'ok',

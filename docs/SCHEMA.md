@@ -2,7 +2,8 @@
 
 **DBMS:** MySQL 8.0+ (InnoDB, `utf8mb4`)
 **Engine:** semua tabel InnoDB
-**Device target:** ZKTeco **X100C** (fingerprint only)
+**Device target:** ZKTeco **X100C** (fingerprint only, firmware ADMS tersedia)
+**Object storage:** template sidik jari disimpan di object storage, MySQL hanya metadata
 **Migrasi:**
 - `migrations/001_init_adms_push.sql` — inti protokol push (7 tabel)
 - `migrations/002_biometric_sync_schedule.sql` — biometrik, sync 2 arah, shift (6 tabel)
@@ -13,41 +14,42 @@
 
 | # | Keputusan | Konsekuensi pada skema |
 |---|---|---|
-| 1 | Device = **X100C** | Fingerprint saja; tidak ada tabel face/photo. `TransFlag` tetap `1111000000`. |
-| 2 | Tarik **hanya sidik jari** (bukan wajah) | Tambah `finger_template` dengan `MEDIUMBLOB`. Tidak ada `face_template`/`biophoto`. |
-| 3 | **Sinkronisasi dua arah** | Tambah `version` + `sync_state` di `finger_template`, dan tabel `sync_log` untuk jejak + resolusi konflik. |
-| 4 | Retensi `iclock_request` = **30 hari** | Kebijakan pembersihan + pemadatan `body_raw` (lihat §13). |
-| 5 | Absensi **dihubungkan ke jadwal shift** | Tambah `shift`, `shift_assignment`, `daily_attendance`, `holiday`. |
+| 1 | Device = **X100C**, firmware ADMS **sudah tersedia** | Bisa langsung implementasi; F0 terlewati |
+| 2 | **Hanya sidik jari**, **2–4 jari per user** | `finger_template`; kapasitas terukur (lihat §12.2) |
+| 3 | Sinkronisasi **dua arah**, konflik **selalu MANUAL** | Tidak ada penimpaan otomatis; `sync_state='conflict'` + `sync_log` |
+| 4 | Sinkronisasi waktu **TimeZone** | Tambah kolom timezone di `device`; wajib diterapkan saat **parse** (§16) |
+| 5 | Template di **object storage** | `finger_template` **tidak lagi menyimpan BLOB**; simpan `object_key` + metadata |
 
-### 0.1 Catatan penting tentang X100C
+### 0.0 Ringkasan perubahan dari revisi sebelumnya
 
-**ADMS adalah fungsi OPSIONAL pada X100C.** Dari lembar spesifikasi: fitur
-standar mencakup SMS, Workcode, DST, Scheduled-bell; sedangkan **ADMS dan
-Webserver masuk daftar "Optional Functions"**. Artinya:
+| Aspek | Sebelum | Sesudah | Alasan |
+|---|---|---|---|
+| Blob template | `MEDIUMBLOB` di MySQL | `object_key` di object storage | Keputusan #5; lihat §8b.1 |
+| Resolusi konflik | "versi lebih tinggi menang" | **Selalu manual** | Keputusan #3; taruhannya rekam ulang |
+| Zona waktu | kolom `device_tz_offset` saja | `tz_name` + `tz_offset_minutes` + penerapan saat parse | Keputusan #4; lihat §16 |
+| Slot jari | tidak dibatasi | 2–4 jari/user (divalidasi aplikasi) | Keputusan #2 |
 
-> **Sebelum implementasi dimulai, pastikan firmware X100C yang dipakai sudah
-> mendukung dan mengaktifkan PUSH/ADMS.** Bila belum, device tidak akan pernah
-> memanggil server, dan seluruh pekerjaan integrasi tidak bisa diuji. Beberapa
-> unit perlu upgrade firmware terlebih dahulu (via USB), lalu fitur PUSH
-> diaktifkan.
+---
 
-Ini risiko paling awal dan paling menentukan pada proyek ini — bukan hal yang
-bisa diabaikan sampai fase akhir.
+## 0.1 Catatan tentang X100C
 
-Spesifikasi X100C yang relevan:
+**ADMS pada X100C adalah fungsi opsional**, tetapi menurut konfirmasi pemangku
+kepentingan, **firmware yang dipakai sudah mendukung ADMS**. Karena itu Fase F0
+di PRD dianggap sudah terlewati.
 
-| Item | Nilai |
-|---|---|
-| Kapasitas sidik jari | 3.200 |
-| Kapasitas kartu | ID dan IC (opsional) |
-| Kapasitas log | 100.000 (120.000 di tabel lain) |
-| Komunikasi | TCP/IP, USB host/client (opsional) |
-| Zona waktu | Perlu diperhatikan; `TimeZone=7` dipakai referensi untuk WIB |
-| Verifikasi | Fingerprint, PIN, kartu RFID opsional |
+Yang tetap perlu diperhatikan:
 
-Karena kapasitas log **100.000 record**, perhatikan kebijakan `ResLogCount`
-dan pengambilan log berkala — bila penuh sebelum tersinkron, punch lama bisa
-terhapus di device dan hilang permanen.
+| Item | Nilai | Implikasi |
+|---|---|---|
+| Kapasitas sidik jari | 3.200 | Batas slot user |
+| Kapasitas log | 100.000 | **Bila penuh, punch lama terhapus di device** |
+| Komunikasi | TCP/IP, USB | Push lewat TCP/IP |
+| Zona waktu | WIB (UTC+7) | Dikirim sebagai `TimeZone`; lihat §16 |
+
+Karena device memakai **waktu dinding lokal** (`YYYY-MM-DD HH:MM:SS`) pada
+push ATTLOG, penerapan zona waktu ada di **jalur parse**, bukan hanya di
+handshake. Ini detail yang mudah terlewat dan menyebabkan seluruh absensi
+bergeser beberapa jam. Lihat §16.
 
 ---
 
@@ -56,7 +58,7 @@ terhapus di device dan hilang permanen.
 ```
                            ┌──────────────────┐
                            │      device      │ 1 device = 1 mesin X100C
-                           │ (SN, token,      │
+                           │ (SN, token,      │ + tz_name, tz_offset
                            │  delay, opt)     │
                            └────────┬─────────┘
                                     │
@@ -66,7 +68,7 @@ terhapus di device dan hilang permanen.
 ┌──────────┐ ┌──────────────┐ ┌──────────┐ ┌──────────┐ ┌───────────┐ ┌──────────┐
 │iclock_   │ │attendance_log│ │command_  │ │device_   │ │finger_    │ │device_   │
 │request   │ │ (punch)      │ │queue     │ │user      │ │template   │ │operlog   │
-│body mntah│ │ UNIQUE hash  │ │C:<id>:cmd│ │(mirror)  │ │(BLOB)     │ │          │
+│body mntah│ │ UNIQUE hash  │ │C:<id>:cmd│ │(mirror)  │ │object_key │ │          │
 └──────────┘ └──────┬───────┘ └──────────┘ └──────────┘ └─────┬─────┘ └──────────┘
                     │                                          │
                     ▼                                          │
@@ -92,6 +94,10 @@ parser menulis ke `attendance_log` / `device_user` / `finger_template`.
 Tabel mentah inilah yang membuat kita bisa memperbaiki parser lalu memproses
 ulang data lama. `attendance_log` kemudian diolah oleh job terjadwal menjadi
 `daily_attendance` dengan bantuan `shift_assignment`.
+
+**Alur blob:** body request (`iclock_request.body_raw`) → blob template
+diekstraksi → diunggah ke object storage → `finger_template.object_key`
+menyimpan penunjuknya. MySQL **tidak** menyimpan byte template.
 
 ---
 
@@ -125,6 +131,13 @@ CREATE TABLE device (
                     COMMENT 'TransFlag= : bitmask tabel yang dikirim device',
     realtime        TINYINT(1)      NOT NULL DEFAULT 1 COMMENT 'Realtime=',
     stamp_version   INT UNSIGNED    NOT NULL DEFAULT 9999 COMMENT 'Stamp=',
+
+    -- Zona waktu (keputusan #4). Lihat §16.
+    tz_name         VARCHAR(64)      NOT NULL DEFAULT 'Asia/Jakarta'
+                    COMMENT 'Zona IANA; SUMBER KEBENARAN untuk parse ATTLOG',
+    tz_offset_minutes SMALLINT       NULL
+                    COMMENT 'Cache offset menit dari tz_name; boleh dihitung ulang',
+    last_tz_sync_at DATETIME         NULL COMMENT 'Offset terakhir dihitung ulang',
 
     -- Kapabilitas (dari registry / balikan -1004)
     supports_userinfo TINYINT(1)    NOT NULL DEFAULT 1,
@@ -271,10 +284,15 @@ CREATE TABLE attendance_log (
     employee_id     BIGINT UNSIGNED NULL
                     COMMENT 'NULL bila PIN tidak cocok dengan employee mana pun',
 
-    -- Waktu
-    punch_at        DATETIME        NOT NULL COMMENT 'Waktu scan menurut DEVICE (bukan server)',
-    punch_date      DATE            NOT NULL COMMENT 'punch_at::DATE, untuk grouping cepat',
-    device_tz_offset SMALLINT       NULL COMMENT 'Offset zona waktu device dalam menit',
+    -- Waktu (lihat §16: device mengirim WAKTU DINDING LOKAL, bukan UTC)
+    punch_at        DATETIME        NOT NULL
+                    COMMENT 'Titik waktu TERNORMALISASI ke UTC (hasil konversi saat parse)',
+    punch_at_local  DATETIME        NOT NULL
+                    COMMENT 'Waktu dinding PERSIS seperti dikirim device; untuk audit',
+    tz_applied      VARCHAR(64)     NOT NULL
+                    COMMENT 'Zona IANA yang dipakai saat parse; jejak agar bisa dihitung ulang',
+    punch_date      DATE            NOT NULL
+                    COMMENT 'Tanggal LOKAL device (punch_at_local::DATE), bukan UTC — grouping laporan',
 
     -- Kode dari device
     status_code     TINYINT         NULL COMMENT '0=in 1=out 2=break_out 3=break_in 4=ot_in 5=ot_out',
@@ -284,7 +302,7 @@ CREATE TABLE attendance_log (
 
     -- Jejak
     record_hash     CHAR(40)        NOT NULL
-                    COMMENT 'SHA1(device|pin|punch_at|status|verify|work_code) — kunci anti-duplikat',
+                    COMMENT 'SHA1(serial|pin|punch_at_local|status|verify|work_code) — kunci anti-duplikat; pakai waktu LOKAL agar stabil terhadap koreksi tz',
     raw_line        VARCHAR(512)    NOT NULL COMMENT 'Baris asli persis seperti dikirim device',
     format_variant  ENUM('positional5','positionalN','keyvalue') NOT NULL,
     parse_status    ENUM('ok','partial','failed') NOT NULL DEFAULT 'ok',
@@ -322,8 +340,23 @@ CREATE TABLE attendance_log (
   dari device, karena perilaku `Stamp` berbeda antar firmware — lebih aman
   memakai isi punch itu sendiri.
 
-- **`punch_at` memakai waktu device, bukan waktu server.** Punch yang tersimpan
-  di device saat jaringan mati tidak boleh tercatat di waktu sinkronisasi.
+  > **Hash memakai `punch_at_local`, BUKAN `punch_at`.** Ini disengaja: bila
+  > admin kelak memperbaiki `device.tz_name`, `punch_at` (UTC) berubah tetapi
+  > punch-nya tetap punch yang sama. Memakai waktu lokal yang dikirim device
+  > membuat hash stabil terhadap koreksi zona. Bila hash memakai `punch_at`,
+  > koreksi zona akan menghasilkan hash baru dan **menggandakan** seluruh
+  > absensi (karena `UNIQUE` tidak lagi cocok).
+
+- **`punch_at` adalah UTC hasil konversi; `punch_at_local` adalah kata device.**
+  Punch yang tersimpan di device saat jaringan mati tidak boleh tercatat di
+  waktu sinkronisasi — karena itu waktu tetap diambil dari isi punch.
+  Lihat §16 untuk aturan konversi dan mengapa keduanya perlu disimpan.
+
+- **`punch_date` memakai tanggal LOKAL device, bukan tanggal UTC.** Untuk
+  device di `Asia/Jakarta` (UTC+7), punch pukul `06:00` lokal adalah `23:00`
+  UTC **hari sebelumnya**. Bila `punch_date` diambil dari UTC, punch pagi dini
+  hari akan masuk ke tanggal kerja yang salah dan merusak laporan harian.
+  Gunakan `punch_at_local::DATE`.
 
 - **`device_id` dan `employee_id` memakai `ON DELETE SET NULL`,** bukan
   `CASCADE`. Menghapus seorang karyawan **tidak boleh** menghapus riwayat
@@ -495,12 +528,30 @@ CREATE TABLE finger_template (
     employee_id   BIGINT UNSIGNED NULL COMMENT 'NULL bila PIN belum dipetakan',
     device_id     BIGINT UNSIGNED NULL
                   COMMENT 'NULL = template master (milik server), bukan salinan device',
+    -- Kolom bayangan untuk UNIQUE. MySQL menganggap setiap NULL berbeda, jadi
+    -- UNIQUE (pin, finger_index, device_id) TIDAK mencegah dua baris "master"
+    -- (device_id NULL) untuk slot yang sama. Diuji: dua INSERT device_id NULL
+    -- untuk (pin,finger_index) sama sama-sama diterima.
+    -- WAJIB VIRTUAL, bukan STORED: pada MySQL 8.0.15 kolom STORED bersama
+    -- foreign key gagal dengan ERROR 1215. Diuji: VIRTUAL berhasil.
+    device_scope  BIGINT UNSIGNED AS (IFNULL(device_id, 0)) VIRTUAL
+                  COMMENT 'device_id dengan NULL->0; HANYA untuk UNIQUE',
     pin           VARCHAR(24)     NOT NULL,
-    finger_index  TINYINT UNSIGNED NOT NULL COMMENT 'Slot jari 0-9',
-    template_data MEDIUMBLOB      NOT NULL COMMENT 'Blob template mentah dari device',
-    template_size INT UNSIGNED    NOT NULL COMMENT 'Ukuran menurut header 2 byte pertama',
+    finger_index  TINYINT UNSIGNED NOT NULL COMMENT 'Slot jari 0-4 (keputusan #2: 2-4 jari/user)',
+
+    -- === Blob TIDAK disimpan di MySQL (keputusan #5) ===
+    object_bucket VARCHAR(64)     NULL COMMENT 'Nama bucket/container object storage',
+    object_key    VARCHAR(512)    NULL COMMENT 'Path objek; NULL selama upload belum sukses',
+    template_sha256 CHAR(64)      NULL COMMENT 'SHA-256 byte template; kunci idempotensi & deteksi drift',
+    content_type  VARCHAR(64)     NULL COMMENT 'mis. application/octet-stream',
+    byte_size     INT UNSIGNED    NULL COMMENT 'Ukuran byte blob yang diunggah',
+    upload_state  ENUM('pending','stored','failed') NOT NULL DEFAULT 'pending'
+                  COMMENT 'pending = metadata ada tapi objek belum terunggah',
+    upload_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    uploaded_at   DATETIME        NULL,
+
     version       INT UNSIGNED    NOT NULL DEFAULT 1
-                  COMMENT 'Naik setiap template berubah; dipakai resolusi konflik',
+                  COMMENT 'Naik setiap template berubah; HANYA informasional (konflik selalu manual)',
     quality_score TINYINT UNSIGNED NULL COMMENT 'Perkiraan kualitas dari heuristik byte',
     is_valid      TINYINT(1)      NOT NULL DEFAULT 1,
     source        ENUM('device','server_import') NOT NULL DEFAULT 'device',
@@ -513,38 +564,107 @@ CREATE TABLE finger_template (
                                   ON UPDATE CURRENT_TIMESTAMP,
 
     PRIMARY KEY (id),
-    UNIQUE KEY uk_finger_slot (pin, finger_index, device_id),
+    -- Satu slot jari untuk satu PIN per device. Memakai device_scope (bukan
+    -- device_id) supaya baris master (device_id NULL) juga unik per slot.
+    UNIQUE KEY uk_finger_slot (pin, finger_index, device_scope),
+    -- Satu blob bisa dipakai beberapa baris (master + salinan device), jadi
+    -- hash TIDAK unik; hanya indeks untuk pencarian duplikat.
+    KEY idx_finger_sha (template_sha256),
     KEY idx_finger_employee (employee_id),
     KEY idx_finger_device (device_id),
     KEY idx_finger_sync (sync_state),
+    KEY idx_finger_upload (upload_state),
 
     CONSTRAINT fk_finger_employee FOREIGN KEY (employee_id)
         REFERENCES employee (id) ON DELETE SET NULL,
     CONSTRAINT fk_finger_device FOREIGN KEY (device_id)
-        REFERENCES device (id) ON DELETE CASCADE
+        REFERENCES device (id) ON DELETE CASCADE,
+    -- CATATAN PENTING: CHECK **tidak ditegakkan** di MySQL 8.0.15; baru aktif
+    -- sejak 8.0.16. Diuji: baris 'stored' tanpa object_key tetap diterima.
+    -- Karena itu constraint ini hanya dokumentasi + jaring pengaman bila
+    -- di-upgrade. Validasi "stored wajib punya object_key + sha256" WAJIB
+    -- diulang di lapisan aplikasi — jangan bergantung pada DB.
+    CONSTRAINT ck_finger_stored CHECK (
+        upload_state <> 'stored'
+        OR (object_key IS NOT NULL AND template_sha256 IS NOT NULL)
+    )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-  COMMENT='Template sidik jari per PIN dan slot jari';
+  COMMENT='Metadata template sidik jari; blob ada di object storage';
 ```
 
-### 8b.1 Mengapa menyimpan blob mentah
+### 8b.0 Dua jebakan MySQL yang sudah diuji (jangan diulang)
+
+Kedua hal ini **tidak** memunculkan error saat `CREATE TABLE` — ia diam, dan
+baru terasa berbulan-bulan kemudian. Keduanya sudah direproduksi di MySQL
+8.0.15:
+
+| Jebakan | Gejala | Perbaikan yang dipakai |
+|---|---|---|
+| `UNIQUE` dengan kolom `NULL` | Dua baris **master** (device_id NULL) untuk slot yang sama keduanya diterima → data master ganda | Kolom `device_scope` generated (NULL→0), UNIQUE memakainya |
+| Generated column `STORED` + FK | `CREATE TABLE` gagal `ERROR 1215 Cannot add foreign key constraint` | Pakai `VIRTUAL`, bukan `STORED` |
+
+Verifikasi yang harus lulus (sudah dijalankan):
+
+```
+INSERT master (device NULL) slot 0, lalu INSERT master kedua slot 0
+  → INSERT kedua DITOLAK: Duplicate entry '9-0-0' for key 'uk_finger_slot'
+INSERT salinan device slot 0 (device_id=1)
+  → DITERIMA (device_scope = 1, tidak bertabrakan dengan 0)
+```
+
+### 8b.1 Mengapa blob dipindah ke object storage
 
 Template sidik jari ZKTeco adalah **format binary rahasia** yang tidak
 didokumentasikan resmi dan berbeda antar keluarga firmware. Menguraikannya
 berdasarkan dugaan adalah cara paling cepat menghasilkan data rusak yang tidak
-bisa dipulihkan.
+bisa dipulihkan. Karena itu blob tetap disimpan **apa adanya** — hanya saja
+lokasi penyimpanannya bukan lagi MySQL.
 
-Karena itu:
-- `template_data` menyimpan **byte persis** seperti yang dikirim device.
-- `template_size` dan `quality_score` bersifat **informasional** — berguna untuk
-  memantau, **bukan** untuk memutuskan validitas.
-- **Jangan pernah** memotong, mengubah, atau "menormalkan" blob ini.
+**Alasan pindah (keputusan #5):**
+
+| Masalah di MySQL | Akibat seiring device bertambah |
+|---|---|
+| Blob ikut ke `mysqldump` | Backup harian membengkak, waktu restore panjang |
+| Baris besar di InnoDB | Buffer pool tercemar; query tabel lain melambat |
+| Replikasi | Setiap blob direplikasi penuh ke semua replika |
+| `max_allowed_packet` | Batas keras per transfer; sulit diramalkan |
+| Biaya | Blob dingin tetap menempati storage DB yang mahal |
+
+Dengan object storage, MySQL hanya menyimpan **metadata kecil**: kunci objek,
+hash, ukuran, dan status. Blob dingin cukup di object storage (lebih murah),
+dan bisa dipindah ke kelas arsip tanpa menyentuh DB.
+
+**Aturan yang tidak berubah:**
+- Blob disimpan **byte persis** seperti yang dikirim device — jangan pernah
+  memotong, mengubah, atau "menormalkan".
+- `byte_size` dan `quality_score` bersifat **informasional** — untuk memantau,
+  **bukan** memutuskan validitas.
+- `template_sha256` dihitung atas byte mentah; dipakai sebagai kunci
+  idempotensi (re-push device dengan isi sama tidak menghasilkan objek baru).
 
 **Verifikasi wajib sebelum mengandalkan isi template:** tarik template dari
-device, kirim ulang persis apa adanya, lalu pastikan user bisa verifikasi
-sidik jari di device. Bila berhasil, format blob sudah benar — tanpa perlu tahu
-strukturnya.
+device, unggah apa adanya, kirim ulang persis byte yang sama ke device, lalu
+pastikan user bisa verifikasi sidik jari di device. Bila berhasil, format blob
+sudah benar — tanpa perlu tahu strukturnya.
 
-### 8b.2 Mengapa ada `device_id` yang boleh NULL
+### 8b.3 Tata kelola object storage
+
+| Aspek | Keputusan | Alasan |
+|---|---|---|
+| Penamaan objek | `templates/{pin}/{finger_index}/{sha256}.bin` | Immutable → aman untuk cache CDN, tidak ada tumbukan |
+| Deduplikasi | Lewat `template_sha256` | Master dan salinan device berbagi satu objek |
+| Enkripsi | Wajib (SSE) | Data biometrik = data pribadi sensitif |
+| Akses | **Hanya** via server; tidak pernah presigned URL publik | Device tidak pernah mengakses storage langsung |
+| Retensi objek | Ikut siklus hidup baris (lihat §12.3) | Menghindari objek yatim |
+| Konsistensi | `upload_state='pending'` dulu, lalu `'stored'` | Baris bisa dibuat sebelum unggahan selesai (§8b.5) |
+
+**Objek yatim (orphan).** Bila baris `finger_template` dihapus tetapi objek
+gagal dihapus, objek menjadi yatim. Job pemeliharaan mingguan (§11) mencocokkan
+daftar objek di bucket dengan `object_key` yang masih terpakai, lalu menghapus
+yang tidak terpakai setelah masa tenggang 7 hari (mencegah balapan dengan
+unggahan yang sedang berjalan).
+
+### 8b.4 Mengapa ada `device_id` yang boleh NULL
 
 - `device_id = NULL` → **template master**, dimiliki server. Ini "sumber
   kebenaran" yang dipakai untuk mendorong ke device mana pun.
@@ -555,19 +675,79 @@ template baru, ia disimpan sebagai master (`device_id NULL`, `version + 1`),
 lalu disebarkan ke semua device lain sebagai baris salinan. Tanpa pemisahan
 ini, kita tidak bisa membedakan "template ini berasal dari device mana".
 
-### 8b.3 Siklus `sync_state`
+Baris salinan **berbagi `object_key` yang sama** dengan master — karena itu
+`template_sha256` tidak boleh `UNIQUE`. Satu objek, banyak penunjuk.
+
+### 8b.5 Siklus `sync_state` dan resolusi konflik
 
 | State | Arti |
 |---|---|
 | `in_sync` | Server dan device sepakat |
 | `pending_push` | Master berubah, menunggu dikirim ke device |
 | `pending_pull` | Device melaporkan ada, menunggu ditarik |
-| `conflict` | Ada versi berbeda dan tidak bisa diputuskan otomatis |
+| `conflict` | Ada versi berbeda dan **selalu** menunggu keputusan admin |
 | `failed` | Pengiriman/penarikan gagal berulang |
 
-`version` naik setiap template berubah. Saat membandingkan, **versi lebih
-tinggi menang**; bila versi sama tapi isi berbeda → `conflict` + catat di
-`sync_log` untuk ditinjau admin.
+**Konflik = SELALU MANUAL (keputusan #3).** Tidak ada penimpaan otomatis, baik
+`server_wins` maupun `device_wins`.
+
+Alasannya: taruhannya adalah **karyawan harus merekam ulang sidik jari**. Bila
+server diam-diam menang dan menimpa template yang lebih baik di device, atau
+device diam-diam menimpa master, kerugiannya berupa waktu karyawan dan
+gangguan absensi — bukan sekadar baris database yang salah. Karena itu
+ketidakpastian selalu diangkat ke manusia.
+
+**Kapan sebuah konflik dinyatakan:**
+
+| Kondisi | Tindakan |
+|---|---|
+| `template_sha256` berbeda untuk `(pin, finger_index)` yang sama | `sync_state='conflict'` pada kedua sisi + tulis `sync_log` |
+| `version` sama, `sha256` berbeda | `conflict` (bukan "seri", tapi ketidaksepakatan) |
+| `version` berbeda, `sha256` berbeda | `conflict` — versi **tidak** dipakai untuk memutuskan |
+| `sha256` sama | `in_sync` (tidak ada apa-apa; jangan tulis `sync_log`) |
+
+Perhatikan: `version` tetap naik setiap perubahan, tetapi **hanya sebagai
+informasi** untuk ditampilkan di UI tinjauan. Ia tidak lagi menjadi aturan
+resolusi.
+
+**Tindakan admin saat konflik:** pilih salah satu sumber, tandai baris yang
+kalah sebagai tidak valid (`is_valid = 0`) — jangan dihapus, supaya jejaknya
+tetap ada — lalu set `sync_state` baris pemenang ke `pending_push`, dan isi
+`sync_log.resolved_by = 'manual'`.
+
+### 8b.6 Siklus hidup `upload_state`
+
+Ini bukan siklus sync (itu `sync_state`), melainkan siklus **kurir objek**:
+apakah byte-nya sudah benar-benar tersimpan di bucket.
+
+```
+INSERT baris (pending) ──► unggah ke bucket ──► UPDATE (stored)
+        │                          │
+        │                          └── gagal ──► (failed)  ◄── job retry (§11)
+        │                                              │
+        └── retry habis ◄──────────────────────────────┘
+```
+
+Aturan:
+
+1. **Tulis baris dulu, unggah kemudian.** Baris dibuat dengan
+   `upload_state='pending'` dan `object_key` sudah diisi (kunci ditentukan
+   di server, tidak menunggu storage). Jadi `object_key` boleh NOT NULL
+   walaupun objek belum ada.
+2. **Setelah unggah sukses** → `upload_state='stored'`, `uploaded_at=NOW()`,
+   isi `template_sha256` dan `byte_size` dari byte sebenarnya.
+3. **Urutan ini disengaja** supaya baris tidak pernah menunjuk ke objek yang
+   tidak ada **dan** tidak pernah ada objek tanpa baris. Kalaupun proses mati
+   di tengah, statusnya `pending`/`failed` — terlihat, bukan senyap.
+4. **Jangan pernah** menulis `upload_state='stored'` sebelum unggahan
+   dikonfirmasi sukses. Bila objek hilang belakangan, `CHECK` constraint di
+   atas tetap lolos (metadata masih konsisten) — itu memang tidak terdeteksi
+   DB; deteksinya lewat job pemeliharaan (§8b.3).
+5. `byte_size` dan `template_sha256` diisi **saat unggah**, bukan saat parse,
+   karena keduanya harus mencerminkan byte yang benar-benar tersimpan.
+
+`version` dinaikkan **saat baris master ditulis**, terlepas dari status
+unggahan, supaya UI bisa menampilkan "ada perubahan menunggu disebarkan".
 
 ---
 
@@ -585,6 +765,8 @@ CREATE TABLE sync_log (
     action        ENUM('create','update','delete','query') NOT NULL,
     outcome       ENUM('applied','skipped','conflict','failed') NOT NULL,
     conflict_detail VARCHAR(255)  NULL,
+    -- server_wins/device_wins ada hanya untuk membaca log lama; alur baru
+    -- TIDAK PERNAH menulisnya (keputusan #3: konflik selalu manual).
     resolved_by   ENUM('server_wins','device_wins','manual','none')
                   NOT NULL DEFAULT 'none',
     command_id    BIGINT UNSIGNED NULL,
@@ -794,13 +976,19 @@ mysql -u <user> -p <db> < migrations/002_biometric_sync_schedule.sql
 ### 10.1 Simpan punch, abaikan duplikat (operasi utama ingest)
 ```sql
 INSERT INTO attendance_log
-    (device_id, serial_number, pin, punch_at, punch_date,
+    (device_id, serial_number, pin,
+     punch_at, punch_at_local, tz_applied, punch_date,
      status_code, verify_mode, work_code, record_hash, raw_line, format_variant)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE id = id;   -- no-op bila hash sudah ada
 ```
 `affected_rows` bernilai 1 bila baris baru, 0 bila duplikat — dari situ
 `stored_count` dan `dup_count` dihitung.
+
+> **Catatan tz (§16):** `punch_at` diisi hasil konversi ke UTC, `punch_at_local`
+> diisi **persis** `2026-09-29 08:15:03` seperti dikirim device, `tz_applied`
+> diisi nama zona yang dipakai. `punch_date` diambil dari
+> `punch_at_local::DATE`, **bukan** dari `punch_at`.
 
 ### 10.2 Ambil perintah pending untuk device (respons getrequest)
 ```sql
@@ -834,16 +1022,23 @@ WHERE status = 'active'
 
 ### 10.5 Rekap absensi harian per karyawan
 ```sql
+-- punch_at_local dipakai untuk TAMPILAN; punch_at (UTC) untuk aritmetika waktu.
 SELECT e.pin, e.name, a.punch_date,
-       MIN(a.punch_at) AS first_in,
-       MAX(a.punch_at) AS last_out,
-       COUNT(*)        AS punch_count
+       MIN(a.punch_at_local) AS first_in,
+       MAX(a.punch_at_local) AS last_out,
+       COUNT(*)              AS punch_count
 FROM attendance_log a
 JOIN employee e ON e.id = a.employee_id
 WHERE a.punch_date BETWEEN ? AND ?
 GROUP BY e.pin, e.name, a.punch_date
 ORDER BY a.punch_date, e.pin;
 ```
+
+> **Kenapa `punch_at_local` di sini?** Laporan dibaca manusia dalam jam lokal.
+> `punch_date` sudah berbasis lokal (§5), jadi memakai `punch_at` (UTC) akan
+> menampilkan jam yang bergeser — mis. punch `06:00` WIB tampil sebagai
+> `23:00` hari sebelumnya. Gunakan `punch_at` **hanya** saat menghitung durasi
+> atau selisih antar device di zona berbeda.
 
 ### 10.6 Punch yang belum terpetakan ke karyawan
 ```sql
@@ -865,7 +1060,7 @@ ORDER BY total DESC;
 | `device_operlog` | Sedang | Retensi 90 hari |
 | `command_queue` | Lambat | Hapus baris `acked`/`failed` > 30 hari |
 | `device_user` | Statis | Ikut device (CASCADE) |
-| `finger_template` | Statis (~3.200 blob/device) | Perkirakan **~30–60 MB/device**; lihat §12 |
+| `finger_template` | Statis (baris kecil, blob di object storage) | Metadata **~1 KB/baris**; blob ~6–16 MB/device di bucket; lihat §12.2 |
 | `sync_log` | Cepat | Hanya catat `applied`/`conflict`/`failed`; retensi 90 hari |
 | `daily_attendance` | Terkendali (1 baris/karyawan/hari) | Permanen; bisa dihitung ulang |
 
@@ -929,25 +1124,64 @@ LIMIT 5000;
 
 ### 12.2 Kebutuhan penyimpanan sidik jari
 
-Perkiraan kasar (verifikasi dengan menakar blob nyata dari device sebelum
-finalisasi kapasitas):
+Dengan blob di object storage, MySQL hanya menyimpan **metadata**. Hitung
+keduanya secara terpisah.
+
+**A. Object storage (tempat blob berada).**
 
 ```
-per device = jumlah_user × template_per_user × ukuran_template
-           = 500 user × 2 jari × ~2–5 KB
-           = ~2–5 MB per device (tanpa overhead InnoDB)
+per device = jumlah_user × jari_per_user × ukuran_template
+           = 500 user × 2–4 jari × ~2–5 KB
+           = ~2–10 MB per device
 ```
 
-InnoDB menambah overhead; perkirakan **~2× ukuran data mentah**. Untuk 3.200
-slot penuh (kapasitas maksimum X100C), siapkan **~30–60 MB per device**.
+Untuk 3.200 slot penuh (kapasitas maksimum X100C): **~6–16 MB per device**.
+Angka ini kecil — namun deduplikasi tetap penting: master dan salinan device
+untuk jari yang sama **berbagi satu objek**, jadi biaya riil tidak tumbuh
+linear terhadap jumlah device.
+
+**B. MySQL (metadata saja).**
+
+```
+per baris ≈ 512 (object_key) + 64 (bucket) + 64 (sha256) + ~120 kolom lain
+         ≈ ~0,8–1 KB (belum termasuk overhead InnoDB)
+```
+
+Untuk 500 user × 4 jari × 3 device = 6.000 baris → **~6 MB**. Bandingkan
+dengan skema lama (`MEDIUMBLOB`): 6.000 × ~4 KB = **~24 MB blob di InnoDB**,
+plus overhead ~2×. Jadi MySQL mengecil drastis, dan yang besar dipindah ke
+storage yang lebih murah.
+
+**Rencana kapasitas.** Siapkan bucket dengan lifecycle rule: objek diakses
+jarang > 90 hari dipindah ke kelas arsip. Jangan hapus — template lama masih
+diperlukan untuk audit dan pemulihan.
 
 **Catatan penting:** template sidik jari adalah **data biometrik pribadi**.
 Perlakukan sebagai data sensitif:
 - Batasi akses ke tabel ini (jangan tampilkan di API umum).
-- Jangan pernah mengirim blob ke client browser.
+- **Jangan pernah** memberi URL langsung ke blob; server yang mem-proxy.
+- **Jangan pernah** mengirim blob ke client browser.
 - Audit unduhan template.
-- Pertimbangkan enkripsi at-rest di level tabel/kolom.
+- Enkripsi at-rest (SSE) di bucket — wajib, karena blob keluar dari DB.
+- Gunakan bucket privat; tolak akses anonim di level kebijakan bucket.
 - Pastikan ada dasar hukum/consent dari karyawan sesuai regulasi setempat (PDP).
+
+### 12.3 Siklus hidup objek vs baris
+
+Objek dan baris **tidak** boleh berumur beda tanpa pengawasan:
+
+| Kejadian | Tindakan pada objek |
+|---|---|
+| Baris `is_valid = 0` (kalah konflik) | **Pertahankan** objek; baris masih ada untuk jejak |
+| Baris `finger_template` dihapus | Hapus objek **setelah** transaksi commit (outbox) |
+| Baris master dihapus tetapi salinan device masih ada | **Jangan** hapus objek — masih ditunjuk baris lain |
+| Penghapusan objek gagal | Catat di antrean; job mingguan mengulang (§8b.3) |
+| Unggahan `failed` > 7 hari | Hapus baris + objek bila ada, atau tandai untuk tinjauan |
+
+Aturan praktis: **satu objek hanya boleh dihapus bila tidak ada baris mana pun
+yang menunjuk `object_key` itu.** Karena itu penghapusan objek harus lewat
+`LEFT JOIN` pemeriksaan, bukan asumsi "satu baris satu objek".
+
 
 ---
 
@@ -957,29 +1191,67 @@ Ini yang perlu dipahami saat mengimplementasikan keputusan "YA, dua arah".
 
 ### 13.1 Aturan penyelesaian konflik
 
+**Anggap `version` tidak ada** saat memutuskan. Yang menentukan hanya ada/tidak
+dan apakah byte-nya identik (`template_sha256`).
+
 | Kondisi | Tindakan |
 |---|---|
-| Hanya ada di server | Push ke device (`pending_push`) |
-| Hanya ada di device | Tarik ke server sebagai master (`pending_pull`) |
-| Keduanya ada, `version` server > device | Push ke device |
-| Keduanya ada, `version` device > server | Tarik dari device, jadikan master |
-| `version` sama, isi **sama** | `in_sync` — tidak ada aksi |
-| `version` sama, isi **berbeda** | `conflict` → catat di `sync_log`, tunggu admin |
+| Hanya ada di server | Push ke device (`pending_push`) — bukan konflik |
+| Hanya ada di device | Tarik ke server sebagai master (`pending_pull`) — bukan konflik |
+| Keduanya ada, `sha256` **sama** | `in_sync` — tidak ada aksi, **jangan** tulis `sync_log` |
+| Keduanya ada, `sha256` **berbeda** | `conflict` → `sync_log`, tunggu admin (**apa pun versinya**) |
+
+Perhatikan baris terakhir: **tidak ada** kasus "versi lebih tinggi menang".
+Baik versi server lebih tinggi, versi device lebih tinggi, maupun versinya
+sama — semuanya berakhir di `conflict`. Ini konsekuensi langsung dari keputusan
+#3 (selalu manual).
 
 **Aturan emas: jangan pernah menimpa data sidik jari secara diam-diam.**
-Template sidik jari sulit direproduksi (karyawan harus datang dan merekam
-ulang). Bila ragu, tandai `conflict` dan minta keputusan manusia — itu jauh
-lebih murah daripada menghapus sidik jari orang.
+Template sidik jari sulit direproduksi — karyawan harus datang dan merekam
+ulang, dan sidik jari orang tidak bisa "diperbaiki" dari backup. Karena itu
+ketidakpastian selalu diangkat ke manusia; itu jauh lebih murah daripada
+menghapus sidik jari orang.
+
+**Alur keputusan admin** (tidak ada jalur otomatis):
+
+```
+conflict terdeteksi
+      │
+      ▼
+  tampilkan di UI: PIN, jari, versi server, versi device, waktu tiap sisi
+      │
+      ├── admin pilih sisi server  ──► sisi device: is_valid=0, sync_state='in_sync'
+      │                                 sisi server: sync_state='pending_push'
+      │
+      ├── admin pilih sisi device  ──► sisi server: is_valid=0, master diganti
+      │                                 sisi device: sync_state='in_sync'
+      │
+      └── admin minta rekam ulang  ──► kedua sisi: is_valid=0
+                                        (karyawan rekam jari baru di device)
+```
+
+Setiap keputusan mengisi `sync_log.resolved_by = 'manual'` pada baris konflik
+yang bersangkutan. Baris yang "kalah" **tidak dihapus** — hanya
+`is_valid = 0` — supaya jejak dan alasan keputusan tetap bisa diaudit.
+
+> **Catatan `resolved_by`:** enum menyimpan `server_wins`/`device_wins` untuk
+> kompatibilitas riwayat, tetapi pada alur ini nilai itu **tidak dipakai**.
+> Nilai yang muncul adalah `manual` (diputuskan admin) dan `none` (belum
+> diputuskan). Jangan menambahkan jalur kode yang menulis
+> `server_wins`/`device_wins` — itu bertentangan dengan keputusan #3.
+
 
 ### 13.2 Bentuk `sync_log` aman yang mencegah banjir log
 
 ```sql
--- Catat hasil sinkronisasi. Lihat §8c: JANGAN catat 'skipped' yang normal.
+-- Catat konflik. Lihat §8c: JANGAN catat 'skipped' yang normal.
+-- conflict_detail menyebut SHA pendek kedua sisi, bukan versi — versi tidak
+-- lagi dipakai sebagai dasar keputusan (keputusan #3: selalu manual).
 INSERT INTO sync_log
     (device_id, serial_number, direction, entity_type, pin, finger_index,
      action, outcome, conflict_detail, resolved_by)
 SELECT ?, ?, 'device_to_server', 'finger_template', ?, ?, 'update', 'conflict',
-       'server v3 | device v3 (isi berbeda)', 'manual';
+       CONCAT('server sha=', LEFT(?, 12), ' | device sha=', LEFT(?, 12)), 'manual';
 ```
 
 Query untuk menampilkan konflik yang menunggu keputusan admin:
@@ -1204,3 +1476,142 @@ dengan `status='pending'` sampai admin menyetujuinya.
 masalahnya ada di jaringan/firmware device, **bukan** di kode server.
 
 ---
+
+## 16. Zona waktu — keputusan #4 (`TimeZone`)
+
+Keputusan pemangku kepentingan: sinkronisasi waktu memakai **TimeZone**, bukan
+offset tetap yang di-hardcode. Ini lebih benar, tetapi menuntut satu hal yang
+sering terlewat: **zona waktu harus diterapkan saat PARSE, bukan saat render.**
+
+### 16.1 Akar masalah
+
+Device X100C mengirim waktu ATTLOG sebagai **waktu dinding lokal**, mis.
+`2026-09-29 08:15:03` — tanpa penanda zona. Device **tidak** mengirim UTC.
+
+Artinya baris itu ambigu: `08:15` di WIB (UTC+7) dan `08:15` di WITA (UTC+8)
+adalah momen yang berbeda. Bila server menafsirkannya dengan asumsi yang salah
+— atau membiarkan MySQL menafsirkannya sebagai waktu server — seluruh absensi
+bergeser beberapa jam. Ini bukan bug yang memunculkan error; datanya tetap
+"terlihat masuk", hanya **salah**. Karena itu ia berbahaya.
+
+### 16.1b Prasyarat: tabel zona waktu MySQL HARUS dimuat
+
+Bila `CONVERT_TZ()` dipakai, tabel zona waktu MySQL harus dimuat lebih dulu.
+Pada instalasi bersih, `mysql.time_zone_name` berisi **0 baris** dan
+`CONVERT_TZ('2026-09-29 06:00:00','Asia/Jakarta','UTC')` mengembalikan
+**NULL** — bukan error. Sudah diuji di MySQL 8.0.15.
+
+Bahayanya: NULL itu masuk ke kolom `punch_at` (`NOT NULL`) dan INSERT gagal
+dengan `ERROR 1048 Column 'punch_at' cannot be null`; atau bila kolomnya
+nullable, tersimpan NULL dan absensi hilang begitu saja.
+
+Muat sekali per server:
+
+```bash
+# Linux/macOS
+mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql -u root mysql
+```
+
+Verifikasi wajib **sebelum** aplikasi jalan:
+
+```sql
+-- Harus mengembalikan 2026-09-28 23:00:00. Bila NULL, tz belum dimuat.
+SELECT CONVERT_TZ('2026-09-29 06:00:00','Asia/Jakarta','UTC');
+```
+
+**Alternatif yang lebih tahan banting (disarankan):** konversi tz di
+**lapisan aplikasi** memakai `zoneinfo` (Python 3.9+, data tz bawaan OS), lalu
+kirim UTC langsung ke MySQL. Dengan cara ini server DB tidak bergantung pada
+`mysql_tzinfo_to_sql`, dan aturan DST/offset selalu mutakhir.
+
+Untuk kasus sederhana tanpa aturan DST (Indonesia tidak memakai DST), offset
+tetap juga sah dan **sudah diuji berhasil**:
+
+```sql
+-- WIB = UTC+7 = 420 menit; 06:00 lokal -> 23:00 UTC hari sebelumnya
+DATE_SUB(TIMESTAMP('2026-09-29','06:00:00'), INTERVAL 420 MINUTE)
+-- hasil: 2026-09-28 23:00:00
+```
+
+Tapi begitu ada device di yurisdiksi ber-DST, aritmetika offset tetap akan
+salah. Karena itu `tz_name` tetap sumber kebenaran; `tz_offset_minutes` hanya
+cache.
+
+
+### 16.2 Kolom yang ditambahkan di `device`
+
+```sql
+ALTER TABLE device
+  ADD COLUMN tz_name VARCHAR(64) NOT NULL DEFAULT 'Asia/Jakarta'
+             COMMENT 'Zona waktu IANA; sumber kebenaran untuk parse ATTLOG',
+  ADD COLUMN tz_offset_minutes SMALLINT NULL
+             COMMENT 'Cache offset menit dari tz_name; diisi saat handshake/refresh',
+  ADD COLUMN last_tz_sync_at DATETIME NULL
+             COMMENT 'Kapan offset terakhir dihitung ulang (DST/perubahan aturan)';
+```
+
+- `tz_name` pakai nama IANA (`Asia/Jakarta`, `Asia/Makassar`, `Asia/Jayapura`)
+  — **jangan** pakai offset mentah seperti `+07:00`. Nama IANA tetap benar bila
+  aturan zona berubah (mis. DST di yurisdiksi lain), offset mentah tidak.
+- `tz_offset_minutes` hanyalah **cache** untuk kueri cepat; ia harus bisa
+  dihitung ulang dari `tz_name` kapan saja. Jangan jadikan satu-satunya sumber.
+
+### 16.3 Aturan penerapan (3 tingkat, urutan jatuh)
+
+Saat memparse ATTLOG, tentukan zona dengan urutan berikut — berhenti di yang
+pertama cocok:
+
+| Tingkat | Sumber | Kapan dipakai |
+|---|---|---|
+| 1 | `device.tz_name` | Normal; device terdaftar dan punya zona |
+| 2 | `settings.default_tz_name` (server) | Device belum punya `tz_name` (mis. baris `pending`) |
+| 3 | `UTC` | Cadangan terakhir; **wajib** dicatat sebagai anomali |
+
+Tingkat 2 dan 3 harus memicu peringatan (log + metrik), karena artinya ada
+device yang zonenya belum dikonfigurasi dengan benar.
+
+### 16.4 Apa yang disimpan
+
+| Kolom | Isi | Alasan |
+|---|---|---|
+| `attendance_log.punch_at` | Waktu **UTC** (konversi dari waktu lokal device) | Titik waktu tunggal, tidak ambigu; aman lintas zona |
+| `attendance_log.punch_at_local` | Waktu dinding lokal apa adanya | Untuk audit: "device bilang jam berapa" |
+| `attendance_log.tz_applied` | Nama zona yang dipakai saat parse | Jejak; bila tz device diperbaiki, bisa dihitung ulang |
+| `attendance_log.raw_text` | Baris ATTLOG mentah | Pemulihan bila logika parse diperbaiki |
+
+**Simpan yang asli, simpan yang ternormalisasi.** Menyimpan hanya satu di
+antaranya adalah kesalahan: hanya UTC → kehilangan jejak; hanya lokal → tidak
+bisa dibandingkan antar device di zona berbeda.
+
+### 16.5 TimeZone pada handshake
+
+Handshake (`GET OPTION FROM: <SN>`) mengirim `TimeZone=<offset jam>`. Ini
+memberi tahu device offset yang diharapkan. Perhatikan dua hal:
+
+1. Format handshake ZKTeco memakai **offset jam bilangan bulat** (mis. `7`),
+   bukan nama IANA. Karena itu `tz_offset_minutes` dipetakan ke jam bulat saat
+   membentuk respons handshake.
+2. Zona dengan offset pecahan (mis. `Asia/Kathmandu`, `+05:45`) **tidak** bisa
+   diwakili offset jam bulat. Bila kelak ada device di zona seperti itu,
+   handshake tetap memakai pembulatan, tetapi **parse wajib memakai `tz_name`**
+   yang tepat — jangan ikut pembulatan handshake.
+
+### 16.6 Perubahan zona waktu
+
+Bila admin mengubah `device.tz_name` untuk device yang sudah punya data,
+**data lama tidak otomatis dihitung ulang** — itu berbahaya dan bisa
+menggandakan pergeseran. Sebagai gantinya:
+
+1. Perubahan hanya berlaku untuk punch **baru** (`punch_at >= waktu perubahan`).
+2. Punch lama menyimpan `tz_applied`-nya sendiri, sehingga tetap terbaca benar.
+3. Bila memang perlu koreksi massal, jalankan skrip **terpisah** yang
+   menghitung ulang `punch_at` dari `punch_at_local` + `tz_applied`, dengan
+   backup dan laporan jumlah baris yang berubah.
+
+**Uji yang harus lulus sebelum menganggap tz benar:** set device ke `WIB`,
+catat satu punch, lalu bandingkan `punch_at_local` (jam dinding yang
+ditampilkan device) dengan `punch_at` dalam UTC. Selisihnya harus tepat offset
+`WIB` (+7). Ulangi untuk satu device di zona berbeda bila ada.
+
+---
+

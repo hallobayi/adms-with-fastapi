@@ -1,45 +1,61 @@
 # PRD — Implementasi ZKTeco iClock / ADMS Push Protocol
 
 **Proyek:** ADMS (Attendance Device Management System)
-**Versi dokumen:** 2.0
+**Versi dokumen:** 3.0
 **Tanggal:** 2026-09-29
-**Status:** Siap implementasi — keputusan terbuka sudah dijawab
-**Stack:** FastAPI + MySQL 8 (`app/` yang sudah direfactor)
+**Status:** Siap implementasi — seluruh keputusan terbuka sudah dijawab
+**Stack:** FastAPI + MySQL 8 (`app/` yang sudah direfactor) + object storage
 
 ---
 
 ## 0. Keputusan yang sudah ditetapkan
 
+### 0.1 Putaran 1
+
 | # | Pertanyaan | Keputusan | Dampak |
 |---|---|---|---|
 | 1 | Model device | **ZKTeco X100C** | Fingerprint saja; varian ATTLOG yang diuji dibatasi ke yang didukung X100C |
-| 2 | Template biometrik | **HANYA sidik jari** | Tambah `finger_template` (BLOB). Tabel face/photo **tidak** dibuat. |
+| 2 | Template biometrik | **HANYA sidik jari** | Tambah `finger_template`. Tabel face/photo **tidak** dibuat. |
 | 3 | Sinkronisasi user | **DUA ARAH** | Perlu `version` + `sync_state`, tabel `sync_log`, dan aturan konflik eksplisit |
 | 4 | Retensi `iclock_request` | **30 hari** | Job pembersihan + pemadatan `body_raw` bertahap |
 | 5 | Hubungkan ke shift | **YA** | Tambah `shift`, `shift_assignment`, `daily_attendance`, `holiday` |
 
-**Konsekuensi penting dari keputusan #3:** sinkronisasi dua arah sidik jari
-adalah bagian paling berisiko di proyek ini. Template sidik jari tidak bisa
+### 0.2 Putaran 2
+
+| # | Pertanyaan | Keputusan | Dampak |
+|---|---|---|---|
+| 6 | Firmware X100C sudah ADMS? | **YA** | Fase F0 (verifikasi firmware) **terlewati**; bisa langsung F1 |
+| 7 | Jumlah jari per user | **2–4 jari** | `finger_index` 0–4; validasi jumlah di aplikasi |
+| 8 | Aturan konflik sync | **SELALU MANUAL** | **Tidak ada** auto-overwrite; konflik selalu ke admin |
+| 9 | Sinkronisasi waktu | **TimeZone** | Kolom `tz_name` di `device`; penerapan **saat parse** (lihat SCHEMA §16) |
+| 10 | Lokasi arsip template | **Object Storage** | `finger_template` **tidak** menyimpan BLOB; hanya `object_key` + metadata |
+
+**Konsekuensi penting dari keputusan #3 + #8:** sinkronisasi dua arah sidik
+jari adalah bagian paling berisiko di proyek ini, dan kita memilih untuk
+**tidak pernah** menimpa secara otomatis. Template sidik jari tidak bisa
 "diperbaiki" — bila salah menimpa, karyawan harus datang dan merekam ulang.
-Lihat §6 FR-7 dan §5 NFR-6.
+Menambah manusia di jalur keputusan memang menambah kerja admin, tetapi itu
+jauh lebih murah daripada kehilangan sidik jari orang. Lihat §FR-7 dan NFR-6.
 
 Dokumen terkait: `docs/PROTOCOL-SPEC.md` (wire format),
 `docs/SCHEMA.md` (desain tabel), `migrations/` (skrip SQL).
 
 ---
 
-## 0.1 Peringatan awal — ADMS adalah fitur OPSIONAL di X100C
+## 0.3 Peringatan awal — ADMS adalah fitur OPSIONAL di X100C
 
 Dari lembar spesifikasi X100C, **ADMS dan Webserver tercantum sebagai
 "Optional Functions"**, berbeda dari SMS/Workcode/DST/Scheduled-bell yang
 standar. Ini berarti device yang dibeli belum tentu bisa memakai mode push.
 
-> **Tindakan sebelum fase F1:** pastikan firmware X100C yang ada sudah
-> mendukung PUSH/ADMS. Bila belum, device perlu upgrade firmware via USB.
-> **Seluruh pekerjaan integrasi tidak bisa diuji tanpa ini.**
+> **Status:** pemangku kepentingan mengonfirmasi **firmware yang dipakai sudah
+> mendukung ADMS** (keputusan #6). Karena itu **F0 terlewati**.
 
-Ini bukan detail administratif — ini penentu apakah proyek bisa berjalan.
-Sebaiknya diverifikasi dengan satu device contoh sebelum menulis banyak kode.
+Namun peringatan ini tetap dipertahankan sebagai catatan: bila kelak ada unit
+X100C baru dengan firmware lebih tua, unit itu **tidak** otomatis bisa push.
+Verifikasi cepat per unit baru: setelah `Server Address`/`Server Port` diisi,
+device harus memanggil `GET /iclock/cdata?SN=<SN>` dalam 1 menit. Bila tidak,
+masalahnya firmware/jaringan — bukan kode server.
 
 ---
 
@@ -65,7 +81,10 @@ cukup device bisa menjangkau URL server.
 | G4 | Server dapat mengirim perintah ke device | Tambah/hapus user sampai di device < 1 siklus poll |
 | G5 | Data mentah tersimpan untuk audit | Body mentah tiap request tersimpan utuh |
 | G6 | Sidik jari tersinkron dua arah | User yang didaftarkan di satu device bisa verifikasi di device lain |
+| G6b | **Konflik sidik jari tidak pernah ditimpa otomatis** | Ketidaksepakatan selalu berakhir di tinjauan admin, bukan kehilangan data |
 | G7 | Keterlambatan dihitung otomatis | `daily_attendance` terisi tanpa intervensi manual |
+| G8 | Waktu punch benar lintas zona | `punch_at` UTC akurat; absensi tidak bergeser jam |
+| G9 | Blob sidik jari tidak membebani MySQL | Hanya metadata di DB; byte di object storage |
 
 ### 1.2 Non-tujuan (di luar cakupan)
 
@@ -75,6 +94,8 @@ cukup device bisa menjangkau URL server.
 - Manajemen akses pintu (door control), alarm, dan interlock.
 - Aplikasi web UI penuh untuk manajemen karyawan (hanya API + halaman monitor sederhana).
 - Penggajian (payroll). Sistem ini menghasilkan data kehadiran, bukan slip gaji.
+- **Penyimpanan blob di MySQL.** Sudah diputuskan pindah ke object storage
+  (keputusan #10); jalur MySQL-blob tidak akan dibangun.
 
 ---
 
@@ -357,17 +378,48 @@ ulang menjadi tidak berbahaya.
 - **FR-7.2** Server dapat menarik template dari device (device → server) dengan
   `DATA QUERY USERINFO` lalu membaca push `table=USERINFO` / template.
 - **FR-7.3** Setiap perubahan template menaikkan `version` dan menyetel
-  `sync_state='pending_push'`.
-- **FR-7.4** Aturan konflik (lihat `docs/SCHEMA.md` §13.1):
-  versi lebih tinggi menang; versi sama + isi berbeda → `conflict`,
-  dicatat di `sync_log`, menunggu keputusan admin.
+  `sync_state='pending_push'`. **`version` hanya informasional** — ia tidak
+  dipakai untuk memutuskan pemenang konflik.
+- **FR-7.4** Aturan konflik (keputusan #8, lihat `docs/SCHEMA.md` §13.1):
+  **selalu manual**. Apa pun versinya, bila `template_sha256` kedua sisi
+  berbeda → `conflict` + catat di `sync_log`, menunggu keputusan admin.
+  **Tidak ada** jalur `server_wins`/`device_wins`.
 - **FR-7.5** **Sistem tidak boleh menimpa template sidik jari secara
-  diam-diam.** Ragu = tandai `conflict`.
+  diam-diam, dalam kondisi apa pun.** Ini aturan mutlak, bukan preferensi.
 - **FR-7.6** Blob template disimpan **byte persis** seperti diterima. Dilarang
   memotong, mengubah, atau menormalkan isi template.
-- **FR-7.7** `sync_log` hanya mencatat `applied`, `conflict`, dan `failed`.
+- **FR-7.7** Blob disimpan di **object storage** (keputusan #10), bukan di
+  MySQL. `finger_template` hanya menyimpan `object_key` + metadata
+  (`template_sha256`, `byte_size`, `upload_state`).
+- **FR-7.8** Baris `finger_template` boleh ditulis **sebelum** unggahan objek
+  selesai (`upload_state='pending'`). Baru setelah unggah terkonfirmasi
+  menjadi `stored`. Aplikasi **wajib** memvalidasi "stored ⇒ `object_key` +
+  `template_sha256` terisi", karena `CHECK` constraint tidak ditegakkan di
+  MySQL 8.0.15.
+- **FR-7.9** Root-cause dedup: master dan salinan device untuk jari yang sama
+  **berbagi satu objek** (`object_key` sama). Karena itu `object_key` hanya
+  boleh dihapus bila tidak ada baris mana pun yang menunjuk padanya.
+- **FR-7.10** `sync_log` hanya mencatat `applied`, `conflict`, dan `failed`.
   Kejadian `skipped` normal tidak dicatat (hanya dihitung sebagai metrik)
   agar tabel tidak membanjir.
+
+### FR-7b Waktu & zona waktu
+- **FR-7b.1** Device mengirim waktu **dinding lokal** tanpa penanda zona;
+  server **wajib** mengonversinya ke UTC **saat parse**, bukan saat render.
+- **FR-7b.2** Zona ditentukan bertingkat: `device.tz_name` → zona default
+  server → UTC. Tingkat 2 dan 3 **wajib** memicu peringatan.
+- **FR-7b.3** Simpan **keduanya**: `punch_at` (UTC) dan `punch_at_local`
+  (kata device apa adanya), plus `tz_applied`. Hanya menyimpan salah satu
+  adalah kesalahan desain.
+- **FR-7b.4** `punch_date` diambil dari tanggal **lokal** device, bukan UTC.
+  Punch 06:00 WIB = 23:00 UTC hari sebelumnya; memakai UTC merusak laporan.
+- **FR-7b.5** `record_hash` memakai `punch_at_local` agar **stabil** terhadap
+  koreksi `tz_name` di kemudian hari. Memakai `punch_at` akan menggandakan
+  absensi setelah koreksi zona.
+- **FR-7b.6** Bila `CONVERT_TZ()` dipakai di MySQL, tabel zona waktu harus
+  dimuat lebih dulu; **disarankan** konversi di lapisan aplikasi
+  (`zoneinfo`) dan kirim UTC langsung. Lihat SCHEMA §16.1b.
+
 
 ### FR-8 Jadwal shift & perhitungan keterlambatan
 - **FR-8.1** Admin dapat mendefinisikan shift (`start_time`, `end_time`,
@@ -438,13 +490,20 @@ ulang menjadi tidak berbahaya.
 
 ### NFR-6 Keamanan data biometrik
 Template sidik jari adalah **data pribadi sensitif** dan tidak bisa diganti
-seperti password.
+seperti password. Dengan keputusan #10 (object storage), sebagian tanggung
+jawab pindah dari DB ke bucket.
 - Tabel `finger_template` **tidak** boleh terekspos di API publik.
-- Blob template **tidak pernah** dikirim ke browser/client.
+- Blob template **tidak pernah** dikirim ke browser/client, dan **tidak
+  pernah** diberikan sebagai URL langsung — server yang mem-proxy.
+- Bucket **privat**; tolak akses anonim di level kebijakan bucket.
+- **Enkripsi at-rest (SSE) wajib** — ini konsekuensi baru dari menyimpan
+  blob di luar DB, karena perlindungan baris InnoDB tidak lagi berlaku.
 - Akses baca blob wajib dicatat (audit).
-- Pertimbangkan enkripsi at-rest.
+- Penamaan objek memakai `sha256` (immutable) sehingga tidak ada tumbukan
+  dan aman untuk cache.
 - Sediakan mekanisme hapus permanen saat karyawan berhenti (hak penghapusan
-  data sesuai regulasi PDP).
+  data sesuai regulasi PDP) — termasuk **menghapus objeknya**, bukan hanya
+  barisnya.
 
 ### NFR-7 Kapasitas device X100C
 - Kapasitas log device **100.000 record**. Bila penuh sebelum tersinkron,
@@ -452,6 +511,18 @@ seperti password.
 - Sistem **wajib** memantau `AttLogCount` (via `GET OPTION`) dan memberi
   peringatan pada ambang tertentu (mis. 70%).
 - Kapasitas sidik jari 3.200 slot; pantau `UserCount`/`FPCount`.
+- Zona waktu: X100C memakai **WIB (UTC+7)** dan **tidak memakai DST**, jadi
+  offset tetap valid. Tetap simpan `tz_name` IANA agar kelak device di zona
+  lain (atau yurisdiksi ber-DST) tidak memaksa perubahan skema.
+
+### NFR-8 Kapasitas storage & penskalaan
+- MySQL hanya menyimpan **metadata** template (~1 KB/baris). Blob di object
+  storage (~2–5 KB/jari; dedup antar device).
+- Bucket memakai lifecycle rule: objek jarang diakses > 90 hari → kelas
+  arsip. Jangan hapus; template lama masih perlu untuk audit.
+- Job mingguan mencocokkan objek di bucket dengan `object_key` yang masih
+  terpakai, lalu membersihkan objek yatim (masa tenggang 7 hari).
+
 
 ---
 
@@ -472,8 +543,15 @@ seperti password.
 | AC-11 | Operlog masuk | Tersimpan, `table='OPERLOG'`, tidak muncul di daftar absensi |
 | AC-12 | Satu PIN, dua slot jari berbeda | **Dua** baris `finger_template` tersimpan |
 | AC-13 | Slot jari sama untuk PIN sama dua kali | Ditolak `uk_finger_slot` (duplikat dicegah) |
+| AC-13b | Dua baris **master** (`device_id NULL`) untuk slot sama | Ditolak `uk_finger_slot` (dipakai `device_scope` NULL→0) |
+| AC-13c | Master + salinan device untuk slot sama | **Diterima** — keduanya boleh ada, berbagi `object_key` |
 | AC-14 | Template diubah ulang | `version` naik, `sync_state='pending_push'` |
-| AC-15 | Versi sama, isi berbeda | `sync_state='conflict'`, tercatat di `sync_log` |
+| AC-15 | **Versi berbeda**, isi berbeda (sisi mana pun lebih tinggi) | `sync_state='conflict'` — **tidak** otomatis menang |
+| AC-15b | Versi sama, `sha256` sama | `in_sync`, **tidak** ada baris baru di `sync_log` |
+| AC-15c | Admin menyelesaikan konflik | Baris kalah `is_valid=0` (bukan dihapus), `resolved_by='manual'` |
+| AC-15d | Blob template diunggah | Baris `upload_state` `pending` → `stored`, `object_key` + `sha256` terisi |
+| AC-15e | Punch 06:00 WIB | `punch_at`=`(D-1) 23:00` UTC, `punch_at_local`=`06:00`, `punch_date`=hari lokal |
+| AC-15f | Punch sama dikirim ulang setelah `tz_name` diperbaiki | Tetap satu baris (hash memakai waktu lokal) |
 | AC-16 | Hapus shift yang masih ditugaskan | **Ditolak** (`RESTRICT`), shift tetap ada |
 | AC-17 | Job hitung ulang jalan dua kali | Hasil sama, tidak ada baris ganda di `daily_attendance` |
 | AC-18 | Koreksi manual lalu job jalan | Nilai manual **tidak** tertimpa |
@@ -489,21 +567,26 @@ seperti password.
 
 | Fase | Isi | Definisi selesai |
 |---|---|---|
-| **F0** | Verifikasi firmware X100C mendukung PUSH/ADMS | Satu device benar-benar memanggil server kita |
-| **F1** | Migrasi skema DB (001 + 002) | Kedua migrasi jalan bersih, 13 tabel terbentuk |
+| **F0** | ~~Verifikasi firmware X100C mendukung PUSH/ADMS~~ | **TERLEWATI** — dikonfirmasi pemangku kepentingan (keputusan #6) |
+| **F1** | Migrasi skema DB (001 + 002) | Kedua migrasi jalan bersih, 13 tabel terbentuk; prasyarat tz dicek |
 | **F2** | Handshake + registrasi device (FR-1) | AC-1 lulus, device nyata dapat konfigurasi |
 | **F3** | Parser + ingest ATTLOG (FR-2) | AC-2, AC-3, AC-11 lulus |
+| **F3b** | Penerapan zona waktu saat parse (FR-7b) | AC-15e, AC-15f lulus; konversi tz terverifikasi |
 | **F4** | Antrian & perintah (FR-4, FR-5) | AC-5..AC-9 lulus |
 | **F5** | API internal (FR-6) | Device bisa disetujui & dipantau |
-| **F6** | Sinkronisasi user + sidik jari (FR-3, FR-7) | AC-12..AC-15, AC-5 lulus |
-| **F7** | Jadwal shift & perhitungan (FR-8) | AC-16..AC-22 lulus |
-| **F8** | Pengerasan, retensi, observabilitas (FR-9, NFR) | AC-10, AC-23 lulus, metrik terlihat |
+| **F6** | Object storage untuk template sidik jari | Unggah/turun blob, `upload_state` benar, dedup objek |
+| **F7** | Sinkronisasi user + sidik jari (FR-3, FR-7) | AC-12..AC-15d lulus |
+| **F8** | Jadwal shift & perhitungan (FR-8) | AC-16..AC-22 lulus |
+| **F9** | Pengerasan, retensi, observabilitas (FR-9, NFR) | AC-10, AC-23 lulus, metrik terlihat |
 
-**F0 adalah gerbang wajib.** Bila firmware X100C tidak mendukung PUSH/ADMS,
-F1–F8 tidak ada gunanya karena tidak akan ada data yang masuk. Selesaikan F0
-lebih dulu, dengan satu device nyata.
+**F0 sudah terlewati.** Karena firmware dikonfirmasi mendukung ADMS, pekerjaan
+bisa langsung mulai dari F1. Meski begitu, **F2 tetap gerbang nyata**: sampai
+satu device benar-benar memanggil `/iclock/cdata`, belum ada bukti apa pun
+bahwa integrasi berjalan.
 
 **F2 dan F3 adalah jalur kritis** — tanpa keduanya tidak ada data yang masuk.
+**F3b** ditambahkan karena zona waktu mudah terlewat: kode bisa terlihat
+"berhasil" padahal semua absensi bergeser beberapa jam (lihat SCHEMA §16).
 
 ---
 
@@ -511,14 +594,19 @@ lebih dulu, dengan satu device nyata.
 
 | Risiko | Dampak | Mitigasi |
 |---|---|---|
-| **Firmware X100C tidak punya ADMS** | Proyek tidak bisa jalan sama sekali | **F0: verifikasi lebih dulu** dengan device nyata; siapkan firmware upgrade |
+| ~~Firmware X100C tidak punya ADMS~~ | ~~Proyek tidak bisa jalan~~ | **Selesai** — dikonfirmasi (keputusan #6); tetap verifikasi per unit baru |
 | Firmware berbeda-beda perilakunya | Parser gagal di sebagian device | Simpan data mentah; parser multi-varian; uji dengan device nyata |
 | Device mengirim ulang tanpa henti | Tabel membengkak | UNIQUE hash + balas `OK` selalu |
 | URL statis membocorkan token | Device lain bisa menyuntik data | Token per device, rotasi token, pantau SN tak dikenal |
 | `Shell` disalahgunakan | Device rusak permanen | Nonaktif default, butuh flag eksplisit + audit |
-| Zona waktu salah | Absensi bergeser | `TimeZone` jadi konfigurasi; simpan UTC + offset device |
+| **Zona waktu salah diterapkan (bukan salah dikirim)** | **Seluruh** absensi bergeser jam; tak ada error yang muncul | Terapkan tz saat **parse**; simpan UTC + lokal + `tz_applied`; AC-15e wajib lulus |
+| **Tabel zona MySQL belum dimuat** | `CONVERT_TZ` → NULL → INSERT gagal atau data hilang | Prasyarat di migration 001; verifikasi `CONVERT_TZ`; **disarankan** konversi di aplikasi |
+| **Koreksi `tz_name` menggandakan absensi** | Punch lama ter-hash ulang → baris ganda | `record_hash` memakai `punch_at_local`, bukan UTC; AC-15f wajib lulus |
 | Jam device tidak akurat | Punch tercatat di waktu salah | Sediakan sinkronisasi waktu opsional, jangan paksa |
-| **Template sidik jari tertimpa salah saat sync 2 arah** | Karyawan harus rekam ulang; data hilang permanen | Versi + `sync_state`; ragu → `conflict`; jangan pernah timpa diam-diam |
+| **Template sidik jari tertimpa salah saat sync 2 arah** | Karyawan harus rekam ulang; data hilang permanen | **Selalu manual** (keputusan #8); `sha256` sebagai pembanding; jangan pernah timpa diam-diam |
+| **Dua baris master untuk slot sama** (NULL di UNIQUE) | Data master ganda, sync bingung | `device_scope` generated NULL→0 di `uk_finger_slot`; AC-13b wajib lulus |
+| **Objek yatim / objek hilang** | Storage membengkak, atau baris menunjuk objek tak ada | `upload_state` dua fase; job mingguan rekonsiliasi bucket |
+| **Blob keluar dari DB tanpa enkripsi** | Perlindungan InnoDB tak berlaku lagi | SSE wajib; bucket privat; server mem-proxy; audit unduhan |
 | **Log device X100C penuh (100.000)** | Punch lama hilang permanen di device | Pantau `AttLogCount`, peringatan di 70%, ambil log berkala |
 | **Salah urai format template** | Blob rusak, tidak bisa dipulihkan | Simpan byte mentah; jangan parse/ubah; verifikasi dengan round-trip ke device |
 | Shift malam salah dipetakan | Semua karyawan shift malam "alpa" | Aturan `effective_work_date`; AC-19 wajib lulus |
@@ -529,19 +617,23 @@ lebih dulu, dengan satu device nyata.
 
 ## 9. Pertanyaan terbuka (sisa)
 
-Keputusan #1–#5 sudah dijawab dan sudah tercermin di dokumen ini serta skema.
-Yang masih perlu dijawab **saat implementasi berjalan**:
+**Semua 10 keputusan sudah dijawab** dan tercermin di dokumen ini,
+`docs/SCHEMA.md`, `docs/PROTOCOL-SPEC.md`, dan kedua migrasi.
 
-1. **Apakah X100C yang ada sudah ber-firmware ADMS?** (paling mendesak —
-   lihat F0)
-2. **Berapa banyak user per device, dan berapa slot jari per user?**
-   Menentukan kebutuhan penyimpanan `finger_template` (perkiraan kasar:
-   ~30–60 MB/device bila penuh).
-3. **Aturan konflik sync yang mana yang dipakai default** — `server_wins`,
-   `device_wins`, atau selalu `manual`? Disarankan **`manual`** untuk sidik
-   jari, karena taruhannya karyawan harus rekam ulang.
-4. **Perlu sinkronisasi waktu otomatis ke device?** Bila device jarang
-   disetel dan jamnya melenceng, semua absensi bergeser. Bisa dipakai
-   `Shell date` atau `TimeZone`, tetapi keduanya punya efek samping.
-5. **Di mana template sidik jari diarsipkan** bila jumlah device bertambah —
-   tetap di MySQL atau pindah ke object storage?
+Yang masih perlu diputuskan **saat implementasi berjalan** (tidak menghambat
+mulai):
+
+1. **Kapasitas nyata per device** — berapa user per device? Ini menentukan
+   rencana kapasitas bucket, bukan desain skema (skema sudah mendukung 3.200
+   slot penuh).
+2. **Vendor object storage** — S3-compatible (MinIO/S3/R2) atau lain? Skema
+   hanya menyimpan `object_bucket` + `object_key`, jadi tidak mengikat.
+3. **Apakah `Shell date` untuk sinkronisasi jam device diaktifkan?** Keputusan
+   #9 (TimeZone) sudah menangani zona; ini soal jam device yang melenceng.
+   `Shell` berisiko dan sebaiknya dibiarkan mati kecuali benar-benar perlu.
+4. **Kebijakan retensi objek template** — berapa lama menyimpan template milik
+   karyawan yang sudah berhenti? Menyentuh hak penghapusan data (PDP).
+
+**Yang harus diverifikasi di F1 (gerbang, bukan pertanyaan):** `CONVERT_TZ`
+mengembalikan nilai benar, atau konversi dilakukan di aplikasi.
+
