@@ -93,9 +93,15 @@ CREATE TABLE IF NOT EXISTS shift (
     start_time        TIME            NOT NULL,
     end_time          TIME            NOT NULL
                       COMMENT 'Bila <= start_time, shift melewati tengah malam',
-    late_tolerance_min SMALLINT UNSIGNED NOT NULL DEFAULT 0
-                      COMMENT 'Toleransi keterlambatan (menit)',
-    early_leave_tol_min SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    -- PENTING: kolom ini SENGAJA signed (bukan UNSIGNED).
+    -- Bila UNSIGNED, ekspresi (selisih_menit - late_tolerance_min) dipromosikan
+    -- ke unsigned, sehingga karyawan yang datang LEBIH AWAL memicu
+    -- ERROR 1690 "BIGINT UNSIGNED value is out of range".
+    -- Sudah diuji: SMALLINT UNSIGNED -> error, SMALLINT -> benar.
+    late_tolerance_min SMALLINT        NOT NULL DEFAULT 0
+                      COMMENT 'Toleransi keterlambatan (menit). Signed, lihat catatan.',
+    early_leave_tol_min SMALLINT       NOT NULL DEFAULT 0
+                      COMMENT 'Toleransi pulang cepat (menit). Signed.',
     is_overnight      TINYINT(1)      NOT NULL DEFAULT 0,
     is_active         TINYINT(1)      NOT NULL DEFAULT 1,
     created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -622,8 +622,10 @@ CREATE TABLE shift (
     start_time        TIME            NOT NULL,
     end_time          TIME            NOT NULL
                       COMMENT 'Bila <= start_time, shift melewati tengah malam',
-    late_tolerance_min SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    early_leave_tol_min SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    -- SENGAJA signed, BUKAN UNSIGNED. Lihat §14.5: kolom UNSIGNED membuat
+    -- (selisih - toleransi) underflow saat karyawan datang lebih awal.
+    late_tolerance_min SMALLINT       NOT NULL DEFAULT 0,
+    early_leave_tol_min SMALLINT      NOT NULL DEFAULT 0,
     is_overnight      TINYINT(1)      NOT NULL DEFAULT 0,
     is_active         TINYINT(1)      NOT NULL DEFAULT 1,
     created_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -646,6 +648,11 @@ malam akan terlihat sebagai "alpa" setiap hari.
 
 Disarankan juga menyimpan `late_tolerance_min` **per shift**, bukan global —
 toleransi untuk shift malam biasanya berbeda dengan shift pagi.
+
+**Catatan desain — tipe kolom toleransi HARUS signed.** Meskipun nilainya
+tidak pernah negatif, `SMALLINT UNSIGNED` akan membuat perhitungan
+keterlambatan melempar `ERROR 1690` saat karyawan datang lebih awal.
+Penjelasan lengkap dan bukti ujinya ada di §14.5.
 
 ### 8e. `shift_assignment`
 
@@ -1077,41 +1084,70 @@ yang sangat terlihat dan sering terjadi.
 
 ### 14.5 Menghitung keterlambatan tanpa error underflow
 
-**Jebakan MySQL yang wajib dihindari.** `TIMESTAMPDIFF()` mengembalikan
-**BIGINT UNSIGNED**. Bila hasilnya dikurangi (mis. toleransi) dan menjadi
-negatif, MySQL melempar:
+**Jebakan MySQL yang sudah diuji dan wajib dihindari.**
+
+`TIMESTAMPDIFF()` sendiri mengembalikan nilai **signed** (`bigint(21)`) dan
+aman terhadap negatif. Penyebab error justru **tipe kolom toleransi**.
+
+Di MySQL, bila satu operand bertipe `UNSIGNED`, **seluruh ekspresi**
+dipromosikan menjadi unsigned. Urutan evaluasi `selisih - toleransi` adalah
+`(signed) - (unsigned)` → hasilnya dipaksa `unsigned`. Begitu selisihnya
+negatif (karyawan datang **lebih awal**), MySQL melempar:
 
 ```
 ERROR 1690 (22003): BIGINT UNSIGNED value is out of range
 ```
 
-Artinya, query yang tampak benar akan **gagal total untuk setiap karyawan yang
-datang lebih awal**. Jangan pernah menulis `GREATEST(0, timestampdiff(...) - toleransi)`.
+Ini pernah terjadi pada versi awal skema ini, yang mendeklarasikan
+`late_tolerance_min SMALLINT UNSIGNED`. **Sudah dibuktikan dengan uji:**
 
-**Cara yang benar — balik urutannya, lalu kurangi:**
+| Kolom | Query | Hasil |
+|---|---|---|
+| `SMALLINT UNSIGNED` | `GREATEST(0, CAST(tsdiff AS SIGNED) - tol)` | ❌ ERROR 1690 |
+| `SMALLINT` | `GREATEST(0, CAST(tsdiff AS SIGNED) - tol)` | ✅ 0 |
+| `SMALLINT` | `CASE WHEN ... THEN ... ELSE 0 END` | ✅ 0 |
+| `SMALLINT` | telat 25 mnt, toleransi 10 | ✅ 15 |
+
+Perhatikan baris pertama: **`CAST(... AS SIGNED)` di operand kiri TIDAK
+menolong** bila operand kanan masih `UNSIGNED`. Membungkus satu sisi saja tidak
+cukup — tipe operand kanan tetap menang.
+
+**Perbaikan yang dipakai:** deklarasikan kolom toleransi sebagai **signed**:
+
+```sql
+late_tolerance_min  SMALLINT NOT NULL DEFAULT 0,   -- BUKAN SMALLINT UNSIGNED
+early_leave_tol_min SMALLINT NOT NULL DEFAULT 0,
+```
+
+Toleransi memang tidak pernah negatif secara nilai, tetapi **tipenya harus
+signed** agar aritmetikanya tidak underflow. Sudah diterapkan di
+`migrations/002_biometric_sync_schedule.sql`.
+
+**Query yang benar** (aman, tanpa `CAST` karena kolomnya sudah signed):
 
 ```sql
 -- late_minutes: keterlambatan setelah toleransi, tidak pernah negatif
-SELECT
-  CASE
-    WHEN a.first_in > ts.scheduled_start
-      THEN GREATEST(0,
-             TIMESTAMPDIFF(MINUTE, ts.scheduled_start, a.first_in)
-             - s.late_tolerance_min)
-    ELSE 0
-  END AS late_minutes
-FROM ...
+CASE
+  WHEN a.first_in > TIMESTAMP(da.work_date, s.start_time)
+    THEN GREATEST(0,
+           TIMESTAMPDIFF(MINUTE, TIMESTAMP(da.work_date, s.start_time), a.first_in)
+           - s.late_tolerance_min)
+  ELSE 0
+END AS late_minutes
 ```
 
-Kunci pemecahannya: **pastikan hanya dihitung saat benar-benar terlambat**
-(`first_in > scheduled_start`). Setelah syarat itu benar, selisihnya sudah
-pasti non-negatif, sehingga pengurangan toleransi tidak lagi underflow.
-Cabang `ELSE 0` menangani kasus datang lebih awal.
+Dua lapis pertahanan di sini:
+1. `CASE ... ELSE 0` memastikan selisih hanya dihitung saat **benar-benar
+   terlambat**, sehingga selisihnya sudah pasti non-negatif.
+2. Kolom signed membuat pengurangan toleransi tidak pernah underflow.
 
-Bila tetap ingin memakai `GREATEST`, ubah tipenya lebih dahulu:
+Bila memakai tabel yang sudah terlanjur UNSIGNED, ubah tipe kolomnya — jangan
+hanya menambal query:
 
 ```sql
-GREATEST(0, CAST(TIMESTAMPDIFF(MINUTE, start, actual) AS SIGNED) - tolerance)
+ALTER TABLE shift
+  MODIFY late_tolerance_min  SMALLINT NOT NULL DEFAULT 0,
+  MODIFY early_leave_tol_min SMALLINT NOT NULL DEFAULT 0;
 ```
 
 Pola yang sama berlaku untuk `early_leave_minutes`.
