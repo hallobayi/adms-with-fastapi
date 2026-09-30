@@ -4,6 +4,14 @@ mysql-connector-python
 python-dotenv
 pydantic
 
+# Basis data zona waktu IANA untuk `zoneinfo`.
+# WAJIB, bukan opsional. Di Windows (dan di image kontainer minimal) basis data
+# zona sistem sering tidak ada: `zoneinfo.TZPATH` kosong dan setiap pencarian
+# nama zona gagal. Tanpa paket ini, seluruh konversi zona diam-diam jatuh ke
+# UTC — punch bergeser 7 jam tanpa satu pun error, persis kegagalan yang
+# paling lama tidak terdeteksi.
+tzdata
+
 # Dipakai untuk pengujian
 pytest
 httpx

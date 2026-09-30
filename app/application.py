@@ -11,6 +11,7 @@ import logging
 from fastapi import FastAPI
 
 from app.config import Settings, get_settings
+from app.iclock import router as iclock_router
 from app.routers import health, items
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(items.router)
+
+    # Endpoint protokol device. Dipasang tanpa syarat: tanpa ini tidak ada
+    # cara apa pun bagi device untuk mengetahui keberadaan server.
+    app.include_router(iclock_router.router)
 
     logger.debug("Aplikasi %s siap", app_settings.app_name)
     return app

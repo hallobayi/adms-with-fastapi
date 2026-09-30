@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 # menyambung ke database — penting agar unit test bisa berjalan tanpa MySQL.
 _pool: pooling.MySQLConnectionPool | None = None
 
+#: Ukuran pool. Handler `/iclock/*` menjalankan pekerjaan database di worker
+#: thread (lihat `app/iclock/router.py`), jadi pool inilah yang membatasi
+#: berapa banyak device bisa dilayani bersamaan. Nilai kecil membuat device
+#: mengantre menunggu koneksi; ambil dari environment supaya bisa dinaikkan
+#: tanpa mengubah kode saat jumlah device bertambah.
+_DEFAULT_POOL_SIZE = 10
+
 
 def _get_pool() -> pooling.MySQLConnectionPool:
     global _pool
@@ -30,7 +37,7 @@ def _get_pool() -> pooling.MySQLConnectionPool:
         logger.info("Membuat connection pool ke %s", settings.database.host)
         _pool = pooling.MySQLConnectionPool(
             pool_name="adms_pool",
-            pool_size=5,
+            pool_size=settings.database.pool_size,
             **settings.database.as_kwargs(),
         )
     return _pool

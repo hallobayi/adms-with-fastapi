@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import partial
+
+import anyio.to_thread
 from fastapi import APIRouter
 
 from app import database
@@ -23,8 +26,12 @@ async def health() -> HealthResponse:
     Selalu membalas 200 agar probe tidak menganggap aplikasi mati hanya
     karena database sedang tidak bisa dihubungi; statusnya dibedakan lewat
     field `database`.
+
+    Ping database bersifat blocking, jadi dijalankan di worker thread: bila
+    MySQL tidak menjawab, kita tidak ingin probe ini menahan event loop —
+    endpoint `/iclock/*` harus tetap dilayani selama itu.
     """
-    db_ok = database.ping()
+    db_ok = await anyio.to_thread.run_sync(partial(database.ping))
     return HealthResponse(
         status="ok",
         database="ok" if db_ok else "degraded",

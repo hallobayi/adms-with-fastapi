@@ -50,6 +50,7 @@ class DatabaseSettings:
     dbname: str
     port: int = 3306
     connect_timeout: int = 10
+    pool_size: int = 10
 
     def as_kwargs(self) -> dict[str, object]:
         """Parameter siap pakai untuk `mysql.connector.connect(...)`."""
@@ -70,6 +71,7 @@ class Settings:
     app_name: str
     debug: bool
     database: DatabaseSettings
+    default_tz_name: str = "Asia/Jakarta"
 
     @property
     def docs_url(self) -> str | None:
@@ -94,9 +96,17 @@ def get_settings() -> Settings:
         dbname=_require("MYSQL_DB"),
         port=int(os.getenv("MYSQL_PORT", "3306")),
         connect_timeout=int(os.getenv("MYSQL_CONNECT_TIMEOUT", "10")),
+        # Ukuran pool menentukan berapa banyak device bisa diproses bersamaan.
+        # Dinaikkan dari angka lama (5) seiring handler iClock dipindah ke
+        # worker thread; lihat `app/database.py`.
+        pool_size=max(1, int(os.getenv("MYSQL_POOL_SIZE", "10"))),
     )
     return Settings(
         app_name=os.getenv("APP_NAME", "ADMS"),
         debug=_get_bool("DEBUG", default=False),
         database=database,
+        # Zona cadangan bila device belum punya `tz_name`. Dipakai saat parse
+        # ATTLOG (lihat app/iclock/timezones.py); bukan sekadar tampilan.
+        default_tz_name=os.getenv("DEFAULT_TZ_NAME", "Asia/Jakarta").strip()
+        or "Asia/Jakarta",
     )
