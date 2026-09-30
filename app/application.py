@@ -10,6 +10,7 @@ import logging
 
 from fastapi import FastAPI
 
+from app.admin import router as admin_router
 from app.config import Settings, get_settings
 from app.iclock import router as iclock_router
 from app.routers import health, items
@@ -36,6 +37,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Endpoint protokol device. Dipasang tanpa syarat: tanpa ini tidak ada
     # cara apa pun bagi device untuk mengetahui keberadaan server.
     app.include_router(iclock_router.router)
+
+    # Dashboard admin (`/api/admin/*`). Seluruh endpoint-nya terlindungi sesi —
+    # penjagaannya ada di dependency `current_admin`, bukan di sini.
+    app.include_router(admin_router)
 
     logger.debug("Aplikasi %s siap", app_settings.app_name)
     return app
