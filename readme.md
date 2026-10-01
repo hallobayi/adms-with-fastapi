@@ -63,11 +63,12 @@ frontend/               # SPA admin (React 19 + TS + Vite), dilayani di /admin
       labels.ts         #   label bahasa Indonesia
     auth/AuthContext.tsx
     components/         #   AppLayout, ProtectedRoute, DataTable, Modal, dst.
-    pages/              #   11 layar (login, dashboard, device, konflik, ...)
+    pages/              #   12 layar (masuk, ringkasan, device, konflik, ...)
 docs/                   # dokumen rancangan
   PRD-ADMS-PUSH.md      # PRD implementasi protokol push ZKTeco
   PROTOCOL-SPEC.md      # referensi teknis wire protocol (untuk parser)
   SCHEMA.md             # penjelasan skema database
+  screenshots/          # tangkapan layar antarmuka web (dipakai readme ini)
 migrations/             # skrip migrasi SQL
   001_init_adms_push.sql            # inti protokol push (7 tabel)
   002_biometric_sync_schedule.sql   # sidik jari, sync 2 arah, shift (6 tabel)
@@ -113,7 +114,6 @@ tidak ada cara login sebelum ada akun.
 - **Waktu dihitung pada jam dinding lokal** (`punch_at_local`), bukan UTC —
   `shift.start_time` adalah jam setempat (SCHEMA §16).
 
-
 ## Antarmuka web (`/admin`)
 
 SPA React yang **dilayani server sendiri** — tidak ada langkah deploy terpisah.
@@ -121,6 +121,62 @@ Dibangun dengan React 19 + TypeScript + Vite, React Router 7 untuk rute, dan
 TanStack Query untuk pemuatan data. CSS ditulis tangan (`src/styles.css`),
 tanpa kerangka CSS: setiap dependensi adalah berkas yang ikut dibangun dan
 dirawat.
+
+### Tangkapan layar
+
+Semua gambar di bawah diambil dari **verifikasi browser sungguhan** (Edge lewat
+CDP) terhadap instance MySQL sementara berisi data contoh yang hasilnya sudah
+diprediksi — bukan mockup.
+
+**Halaman masuk.** Sesi disimpan sebagai cookie HttpOnly, jadi tidak ada token
+yang bisa dibaca JavaScript. Pesan galat sengaja tidak membedakan "username
+tidak ada" dari "password salah".
+
+![Halaman masuk](docs/screenshots/01-masuk.png)
+
+**Ringkasan.** Satu panggilan mengisi seluruh kepala dashboard. Angka yang
+menunggu tindakan diberi warna dan bisa diklik menuju daftarnya; angka nol
+tetap ditampilkan agar tidak terlihat seperti data yang gagal dimuat.
+
+![Dashboard ringkasan](docs/screenshots/02-ringkasan.png)
+
+**Device.** Menjawab "device ini kenapa diam?". Yang ditonjolkan bukan
+identitas device, melainkan kapan terakhir terlihat, berapa perintah yang belum
+diambil device, dan berapa punch yang tidak tertaut ke karyawan mana pun.
+
+![Daftar device](docs/screenshots/03-device.png)
+
+**Konflik.** Tidak ada tombol "selesaikan semua" — itu keputusan desain server,
+dan layar ini mengikutinya. Baris yang kalah ditandai `is_valid = 0`, tidak
+pernah dihapus, supaya jejak auditnya tetap ada.
+
+![Antrean konflik](docs/screenshots/04-konflik.png)
+
+**Kehadiran.** Koreksi manual dan olah ulang dipisah tegas. Di sini olah ulang
+2026-09-28 baru dijalankan dari punch mentah: Budi (masuk 08:45 terhadap shift
+08:00 + toleransi 15 menit) terbaca **terlambat 30 menit**, Siti tepat waktu.
+Ringkasan dihitung atas seluruh hasil filter, bukan hanya halaman yang tampil.
+
+![Rekap kehadiran](docs/screenshots/05-kehadiran.png)
+
+**Karyawan.** PIN adalah jembatan ke device: `attendance_log.pin` dicocokkan ke
+`employee.pin`. Karena itu mengganti PIN memperingatkan lebih dulu dan
+melaporkan berapa punch yang tautannya terputus.
+
+![Data karyawan](docs/screenshots/06-karyawan.png)
+
+**Detail arsip request.** Body mentah diambil saat detail dibuka, bukan ikut
+pada daftar — arsip bisa mencapai 1 MB per baris. Inilah satu-satunya bukti yang
+bisa dipercaya ketika angka `parsed_count` dan `stored_count` berbeda.
+
+![Detail request](docs/screenshots/07-detail-request.png)
+
+**Akun admin** (khusus superuser). Checkbox wewenang dan status aktif
+dinonaktifkan untuk akun sendiri, mengikuti aturan server bahwa superuser tidak
+bisa melucuti wewenangnya sendiri — tanpa itu, satu salah klik bisa membuat
+sistem tidak punya superuser lagi.
+
+![Kelola akun admin](docs/screenshots/08-akun-admin.png)
 
 ### Membangun
 
@@ -204,25 +260,51 @@ Baca berurutan:
 3. [`docs/SCHEMA.md`](docs/SCHEMA.md) — rancangan tabel + alasan tiap keputusan
    (§8b object storage, §13 konflik manual, §16 zona waktu)
 
-Terapkan skema (13 tabel):
+Terapkan skema (15 tabel):
 
 ```bash
 mysql -u <user> -p <database> < migrations/001_init_adms_push.sql
 mysql -u <user> -p <database> < migrations/002_biometric_sync_schedule.sql
+mysql -u <user> -p <database> < migrations/003_admin_auth.sql
 ```
 
-Skema sudah diverifikasi terhadap **MySQL 8.0.15** nyata: kedua migrasi jalan
-bersih dan 13 tabel terbentuk.
+Skema sudah diverifikasi terhadap **MySQL 8.0.15** nyata: ketiga migrasi jalan
+bersih dan 15 tabel terbentuk (7 + 6 + 2).
 
 ## Menjalankan
 
 ```bash
-cp env.example .env      # lalu isi kredensial MySQL
+cp env.example .env                  # lalu isi kredensial MySQL
 pip install -r requirements.txt
-uvicorn main:app --reload
+mysql -u <user> -p <database> < migrations/001_init_adms_push.sql
+mysql -u <user> -p <database> < migrations/002_biometric_sync_schedule.sql
+mysql -u <user> -p <database> < migrations/003_admin_auth.sql
+
+uvicorn main:app --reload            # API di 127.0.0.1:8000
 ```
 
 Dokumentasi interaktif tersedia di `/docs` bila `DEBUG=true`.
+
+Agar antarmuka webnya ikut hidup, bangun SPA-nya sekali (lihat
+[Antarmuka web](#antarmuka-web-admin)) lalu buka `http://127.0.0.1:8000/admin`:
+
+```bash
+cd frontend && npm ci && npm run build
+```
+
+Akun admin pertama belum ada setelah migrasi — buat satu lewat kode, karena
+tidak ada cara login sebelum ada akun:
+
+```bash
+python -c "
+from app.admin import auth
+from app.database import connection
+with connection() as conn:
+    auth.create_admin(conn, username='root', password='<password-kuat>',
+                      display_name='Root', is_superuser=True)
+    conn.commit()
+"
+```
 
 ## Pengujian
 
@@ -255,7 +337,7 @@ Suite di atas tidak menyentuh database, jadi ia tidak bisa membuktikan hal-hal
 seperti `ON DUPLICATE KEY`, FK `RESTRICT`, atau apakah `SUM(...)` benar-benar
 mengembalikan angka yang diharapkan. Untuk itu ada
 `tests/verify_admin_e2e.py`: harness yang menjalankan seluruh alur dashboard
-lewat HTTP (92 pemeriksaan) terhadap instance MySQL sementara, lengkap dengan
+lewat HTTP (95 pemeriksaan) terhadap instance MySQL sementara, lengkap dengan
 data contoh yang sudah diatur agar hasilnya bisa diprediksi.
 
 ```bash
