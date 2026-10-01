@@ -77,6 +77,12 @@ class Settings:
     #: sengaja: `DEBUG=true` membuka /docs dan pesan error detail, dan di
     #: produksi kita mungkin ingin log `DEBUG` tanpa membukanya ke publik.
     log_level: str = "INFO"
+    #: Sajikan SPA admin (`frontend/dist`) di `/admin`. Bila berkasnya belum
+    #: dibangun, aplikasi tetap jalan dan hanya mencatat peringatan — jadi
+    #: mengaktifkannya secara default tidak pernah membuat server gagal start.
+    serve_ui: bool = True
+    #: Lokasi hasil build SPA, relatif terhadap direktori kerja.
+    frontend_dist: str = "frontend/dist"
 
     @property
     def docs_url(self) -> str | None:
@@ -115,4 +121,7 @@ def get_settings() -> Settings:
         default_tz_name=os.getenv("DEFAULT_TZ_NAME", "Asia/Jakarta").strip()
         or "Asia/Jakarta",
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        serve_ui=_get_bool("SERVE_UI", default=True),
+        frontend_dist=os.getenv("FRONTEND_DIST", "frontend/dist").strip()
+        or "frontend/dist",
     )

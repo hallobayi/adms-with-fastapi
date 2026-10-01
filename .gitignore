@@ -7,3 +7,9 @@ venv
 .htaccess
 .user.ini
 .workbuddy-ai/
+
+# Frontend (Vite)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.local
