@@ -172,7 +172,8 @@ def test_superuser_diizinkan_lewat(client: TestClient, monkeypatch) -> None:
     client.app.dependency_overrides[require_superuser] = lambda: pengawas
 
     # `auth.list_admins` adalah satu-satunya akses database di endpoint ini;
-    # diganti dengan nilai tetap supaya tidak perlu MySQL.
+    # diganti dengan nilai tetap supaya tidak perlu MySQL. `fetch()` membuka
+    # koneksinya lewat `app.database.connection`, jadi itu yang di-stub.
     monkeypatch.setattr(
         "app.admin.router_accounts.auth.list_admins",
         lambda conn: [
@@ -184,7 +185,7 @@ def test_superuser_diizinkan_lewat(client: TestClient, monkeypatch) -> None:
         ],
     )
     monkeypatch.setattr(
-        "app.admin.router_accounts.connection", _dummy_connection
+        "app.database.connection", _dummy_connection
     )
 
     try:

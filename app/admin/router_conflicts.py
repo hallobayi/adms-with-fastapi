@@ -9,22 +9,16 @@ meninggalkan jejak di `sync_log`.
 from __future__ import annotations
 
 import logging
-from functools import partial
 
-import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.admin import auth, queries_conflicts, schemas
 from app.admin.dependencies import current_admin
-from app.database import connection
+from app.database import execute, fetch
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/conflicts", tags=["admin:conflicts"])
-
-
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
 
 def _conflict_out(row: dict[str, object]) -> schemas.ConflictOut:
@@ -62,18 +56,14 @@ async def list_conflicts(
     Default `resolved=false` disengaja: pertanyaan pertama admin hampir selalu
     "apa yang harus saya kerjakan sekarang", bukan "apa yang pernah terjadi".
     """
-    def _load():
-        with connection() as conn:
-            return queries_conflicts.list_conflicts(
-                conn,
-                serial_number=serial_number,
-                entity_type=entity_type,
-                resolved=resolved,
-                limit=limit,
-                offset=offset,
-            )
-
-    total, rows = await _run_blocking(_load)
+    total, rows = await fetch(
+        queries_conflicts.list_conflicts,
+        serial_number=serial_number,
+        entity_type=entity_type,
+        resolved=resolved,
+        limit=limit,
+        offset=offset,
+    )
     return schemas.ConflictListResponse(
         total=total, conflicts=[_conflict_out(r) for r in rows]
     )
@@ -84,11 +74,7 @@ async def conflict_summary(
     _: auth.AdminUser = Depends(current_admin),
 ) -> dict[str, int]:
     """Hitungan konflik belum/sudah ditinjau — untuk lencana di dashboard."""
-    def _load():
-        with connection() as conn:
-            return queries_conflicts.conflict_summary(conn)
-
-    return await _run_blocking(_load)
+    return await fetch(queries_conflicts.conflict_summary)
 
 
 @router.get("/{conflict_id}", response_model=schemas.ConflictOut)
@@ -96,11 +82,7 @@ async def get_conflict(
     conflict_id: int,
     _: auth.AdminUser = Depends(current_admin),
 ) -> schemas.ConflictOut:
-    def _load():
-        with connection() as conn:
-            return queries_conflicts.get_conflict(conn, conflict_id)
-
-    row = await _run_blocking(_load)
+    row = await fetch(queries_conflicts.get_conflict, conflict_id=conflict_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Konflik tidak ditemukan."
@@ -124,31 +106,27 @@ async def resolve_conflict(
     Baris yang kalah **tidak dihapus** — hanya `is_valid` diset 0 dan
     `sync_state` menjadi `'conflict'`. Jadi bila ternyata keputusannya keliru,
     jejaknya masih bisa ditelusuri dan diperbaiki.
-    """
-    def _resolve():
-        with connection() as conn:
-            applied, message, affected = queries_conflicts.resolve_conflict(
-                conn,
-                conflict_id,
-                resolution=payload.resolution,
-                note=payload.note,
-            )
-            # Catat siapa yang memutuskan, terpisah dari `resolved_by` yang
-            # menyimpan arah keputusan. Log server adalah tempat yang tepat:
-            # tabel sync_log tidak punya kolom pelaku.
-            if applied:
-                logger.info(
-                    "Konflik %s diputuskan %s oleh admin %r (%s baris terdampak)",
-                    conflict_id, payload.resolution, admin.username, affected,
-                )
-                conn.commit()
-            else:
-                conn.rollback()
-            return applied, message, affected
 
-    applied, message, affected = await _run_blocking(_resolve)
+    Catatan transaksi: bila konflik tidak bisa diterapkan, `resolve_conflict`
+    sudah kembali lebih dulu **tanpa menulis apa pun**, jadi `execute()` yang
+    selalu meng-commit tetap aman di sini — tidak ada perubahan yang ikut
+    tersimpan saat jawabannya ditolak.
+    """
+    applied, message, affected = await execute(
+        queries_conflicts.resolve_conflict,
+        conflict_id=conflict_id,
+        resolution=payload.resolution,
+        note=payload.note,
+    )
     if not applied:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=message)
+
+    # Dicatat setelah commit: log server adalah tempat mencatat siapa yang
+    # memutuskan, dan tabel `sync_log` tidak punya kolom pelaku.
+    logger.info(
+        "Konflik %s diputuskan %s oleh admin %r (%s baris terdampak)",
+        conflict_id, payload.resolution, admin.username, affected,
+    )
 
     return schemas.ConflictResolveResponse(
         conflict_id=conflict_id,

@@ -16,15 +16,14 @@ Dua hal yang disengaja:
 from __future__ import annotations
 
 import logging
-from functools import partial
+from datetime import datetime
 
-import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.admin import auth, schemas
 from app.admin.dependencies import SESSION_COOKIE, current_admin
 from app.config import get_settings
-from app.database import connection
+from app.database import connection, execute, run_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +33,15 @@ router = APIRouter(prefix="/auth", tags=["admin:auth"])
 #: keduanya berarti memberi tahu penyerang akun mana yang benar-benar ada.
 _INVALID_CREDENTIALS = "Username atau password salah."
 
+#: Hash dummy untuk *dummy verify*. Nilainya tidak penting — yang penting
+#: biayanya sama dengan hash asli sehingga waktu respons seragam.
+_DUMMY_HASH = (
+    "pbkdf2_sha256$600000$AAAAAAAAAAAAAAAAAAAAAA==$"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)
 
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
-
-def _set_session_cookie(response: Response, token: str, expires_at) -> None:
+def _set_session_cookie(response: Response, token: str, expires_at: datetime) -> None:
     settings = get_settings()
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -63,6 +65,10 @@ async def login(
     yang tidak ada akan kembali jauh lebih cepat (tidak ada hashing 600k
     iterasi), dan selisih waktu itu cukup untuk menebak username mana yang
     sah.
+
+    Seluruh rangkaian (cari user → verifikasi → rehash → catat login → buat
+    sesi) berjalan dalam **satu transaksi**, jadi dijalankan sebagai satu
+    pekerjaan blocking utuh alih-alih dipecah menjadi beberapa panggilan.
     """
     username = payload.username.strip()
 
@@ -71,11 +77,7 @@ async def login(
             row = auth.find_user_by_username(conn, username)
             if row is None:
                 # Dummy verify agar waktu respons seragam.
-                auth.security.verify_password(
-                    payload.password,
-                    "pbkdf2_sha256$600000$AAAAAAAAAAAAAAAAAAAAAA==$"
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-                )
+                auth.security.verify_password(payload.password, _DUMMY_HASH)
                 conn.commit()
                 return None
 
@@ -101,7 +103,7 @@ async def login(
             conn.commit()
             return (admin_id, uname, display, is_super, token, expires_at)
 
-    result = await _run_blocking(_attempt)
+    result = await run_in_thread(_attempt)
 
     if result is None:
         logger.warning("Login gagal untuk username=%r", username)
@@ -129,15 +131,8 @@ async def logout(request: Request, response: Response) -> schemas.MessageRespons
     perlu tahu apakah sesinya memang ada, dan logout harus terasa idempoten.
     """
     token = request.cookies.get(SESSION_COOKIE)
-
     if token:
-        def _revoke() -> bool:
-            with connection() as conn:
-                revoked = auth.revoke_session(conn, token)
-                conn.commit()
-                return revoked
-
-        await _run_blocking(_revoke)
+        await execute(auth.revoke_session, token=token)
 
     response.delete_cookie(SESSION_COOKIE, path="/")
     return schemas.MessageResponse(message="Sesi diakhiri.")
@@ -165,7 +160,11 @@ async def change_password(
     "saya tidak yakin siapa lagi yang punya akses" — membiarkan sesi lama
     hidup membuat tindakan itu tidak ada gunanya. Sesi yang dipakai sekarang
     ikut tercabut, sehingga admin perlu login ulang.
+
+    Verifikasi password lama + tulis hash baru + cabut sesi harus satu
+    transaksi, jadi dijalankan sebagai satu pekerjaan blocking utuh.
     """
+
     def _change() -> bool:
         with connection() as conn:
             row = auth.find_user_by_username(conn, admin.username)
@@ -183,7 +182,7 @@ async def change_password(
             conn.commit()
             return True
 
-    ok = await _run_blocking(_change)
+    ok = await run_in_thread(_change)
     if not ok:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -13,22 +13,16 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from functools import partial
 
-import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.admin import auth, queries_attendance, schemas
 from app.admin.dependencies import current_admin
-from app.database import connection
+from app.database import execute, fetch
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attendance", tags=["admin:attendance"])
-
-
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
 
 def _attendance_out(row: dict[str, object]) -> schemas.DailyAttendanceOut:
@@ -79,22 +73,18 @@ async def list_attendance(
     dikembalikan — angka "berapa yang telat" akan menyesatkan bila hanya
     mencakup 100 baris pertama.
     """
-    def _load():
-        with connection() as conn:
-            return queries_attendance.list_daily_attendance(
-                conn,
-                work_date=work_date,
-                date_from=date_from,
-                date_to=date_to,
-                employee_id=employee_id,
-                department=department,
-                status=status_filter,
-                only_manual=only_manual,
-                limit=limit,
-                offset=offset,
-            )
-
-    total, summary, rows = await _run_blocking(_load)
+    total, summary, rows = await fetch(
+        queries_attendance.list_daily_attendance,
+        work_date=work_date,
+        date_from=date_from,
+        date_to=date_to,
+        employee_id=employee_id,
+        department=department,
+        status=status_filter,
+        only_manual=only_manual,
+        limit=limit,
+        offset=offset,
+    )
     return schemas.DailyAttendanceListResponse(
         total=total, summary=summary, attendance=[_attendance_out(r) for r in rows]
     )
@@ -106,11 +96,7 @@ async def attendance_summary(
     _: auth.AdminUser = Depends(current_admin),
 ) -> dict[str, int]:
     """Ringkasan cepat `days` hari terakhir untuk kepala dashboard."""
-    def _load():
-        with connection() as conn:
-            return queries_attendance.attendance_summary(conn, days=days)
-
-    return await _run_blocking(_load)
+    return await fetch(queries_attendance.attendance_summary, days=days)
 
 
 @router.patch("/{attendance_id}", response_model=schemas.MessageResponse)
@@ -132,23 +118,18 @@ async def correct_attendance(
             detail="Tidak ada field yang diubah.",
         )
 
-    def _correct() -> bool:
-        with connection() as conn:
-            ok = queries_attendance.correct_daily_attendance(
-                conn,
-                attendance_id,
-                status=payload.status,
-                first_in=payload.first_in,
-                last_out=payload.last_out,
-                late_minutes=payload.late_minutes,
-                early_leave_minutes=payload.early_leave_minutes,
-                overtime_minutes=payload.overtime_minutes,
-                note=payload.note,
-            )
-            conn.commit()
-            return ok
-
-    if not await _run_blocking(_correct):
+    ok = await execute(
+        queries_attendance.correct_daily_attendance,
+        attendance_id=attendance_id,
+        status=payload.status,
+        first_in=payload.first_in,
+        last_out=payload.last_out,
+        late_minutes=payload.late_minutes,
+        early_leave_minutes=payload.early_leave_minutes,
+        overtime_minutes=payload.overtime_minutes,
+        note=payload.note,
+    )
+    if not ok:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Baris kehadiran tidak ditemukan.",
@@ -173,13 +154,10 @@ async def delete_attendance(
     Punch mentah di `attendance_log` **tidak** ikut terhapus; olah ulang
     kapan pun akan membentuknya kembali dari data asli device.
     """
-    def _delete() -> bool:
-        with connection() as conn:
-            ok = queries_attendance.delete_daily_attendance(conn, attendance_id)
-            conn.commit()
-            return ok
-
-    if not await _run_blocking(_delete):
+    ok = await execute(
+        queries_attendance.delete_daily_attendance, attendance_id=attendance_id
+    )
+    if not ok:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Baris kehadiran tidak ditemukan.",
@@ -207,18 +185,12 @@ async def recompute(
     Punch dikelompokkan memakai `punch_date` (tanggal **lokal** device), bukan
     UTC — memakai UTC akan menempatkan punch pagi pada hari kerja yang salah.
     """
-    def _recompute() -> dict[str, int]:
-        with connection() as conn:
-            stats = queries_attendance.recompute_daily(
-                conn,
-                work_date=work_date,
-                employee_id=employee_id,
-                overwrite_manual=overwrite_manual,
-            )
-            conn.commit()
-            return stats
-
-    stats = await _run_blocking(_recompute)
+    stats = await execute(
+        queries_attendance.recompute_daily,
+        work_date=work_date,
+        employee_id=employee_id,
+        overwrite_manual=overwrite_manual,
+    )
     logger.info(
         "Olah ulang %s oleh admin %r: %s dibuat, %s diperbarui, %s manual dilewati",
         work_date, admin.username, stats["created"], stats["updated"],

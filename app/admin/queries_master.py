@@ -21,7 +21,8 @@ from mysql.connector import MySQLConnection
 logger = logging.getLogger(__name__)
 
 #: Urutan kanonik hari kerja, dipakai untuk menormalkan `SET(...)` MySQL.
-_WORK_DAY_ORDER = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+#: Publik karena juga dipakai presenter `app.admin.helpers` saat membaca balik.
+WORK_DAY_ORDER = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 
 
 def _normalize_work_days(days: list[str] | None) -> str | None:
@@ -33,7 +34,7 @@ def _normalize_work_days(days: list[str] | None) -> str | None:
     if days is None:
         return None
     seen = {d.upper() for d in days}
-    ordered = [d for d in _WORK_DAY_ORDER if d in seen]
+    ordered = [d for d in WORK_DAY_ORDER if d in seen]
     return ",".join(ordered) if ordered else "MO,TU,WE,TH,FR"
 
 

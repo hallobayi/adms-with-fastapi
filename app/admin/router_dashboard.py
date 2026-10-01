@@ -11,22 +11,30 @@ database untuk data yang selalu ditampilkan bersama-sama.
 from __future__ import annotations
 
 import logging
-from functools import partial
 
-import anyio.to_thread
 from fastapi import APIRouter, Depends, Query
 
 from app.admin import auth, queries_attendance, queries_conflicts, queries_devices
 from app.admin.dependencies import current_admin
-from app.database import connection
+from app.database import fetch
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dashboard", tags=["admin:dashboard"])
 
 
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
+def _load_summary(conn, *, days: int) -> dict[str, int]:
+    """Gabungkan ketiga ringkasan dalam **satu** koneksi.
+
+    Ketiganya berbagi satu koneksi dengan sengaja: tiga ringkasan ini selalu
+    ditampilkan bersama, dan membuka tiga koneksi terpisah hanya menambah
+    perjalanan ke database tanpa menambah informasi.
+    """
+    summary: dict[str, int] = {}
+    summary.update(queries_devices.device_health_summary(conn))
+    summary.update(queries_conflicts.conflict_summary(conn))
+    summary.update(queries_attendance.attendance_summary(conn, days=days))
+    return summary
 
 
 @router.get("")
@@ -42,12 +50,4 @@ async def dashboard(
     dihitung, lebih baik seluruh endpoint gagal daripada menampilkan dashboard
     yang angkanya diam-diam nol.
     """
-    def _load() -> dict[str, int]:
-        with connection() as conn:
-            summary: dict[str, int] = {}
-            summary.update(queries_devices.device_health_summary(conn))
-            summary.update(queries_conflicts.conflict_summary(conn))
-            summary.update(queries_attendance.attendance_summary(conn, days=days))
-            return summary
-
-    return await _run_blocking(_load)
+    return await fetch(_load_summary, days=days)

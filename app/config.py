@@ -72,6 +72,11 @@ class Settings:
     debug: bool
     database: DatabaseSettings
     default_tz_name: str = "Asia/Jakarta"
+    #: Level log aplikasi (`DEBUG`, `INFO`, `WARNING`, ...). Dipasang sekali di
+    #: `create_app()`; lihat `app/logger.py`. Dipisah dari `debug` dengan
+    #: sengaja: `DEBUG=true` membuka /docs dan pesan error detail, dan di
+    #: produksi kita mungkin ingin log `DEBUG` tanpa membukanya ke publik.
+    log_level: str = "INFO"
 
     @property
     def docs_url(self) -> str | None:
@@ -109,4 +114,5 @@ def get_settings() -> Settings:
         # ATTLOG (lihat app/iclock/timezones.py); bukan sekadar tampilan.
         default_tz_name=os.getenv("DEFAULT_TZ_NAME", "Asia/Jakarta").strip()
         or "Asia/Jakarta",
+        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
     )

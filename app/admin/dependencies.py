@@ -9,24 +9,17 @@ event loop dan ikut menunda device yang sedang mengunggah absensi.
 from __future__ import annotations
 
 import logging
-from functools import partial
 
-import anyio.to_thread
 from fastapi import Depends, HTTPException, Request, status
 
 from app.admin import auth
-from app.database import connection
+from app.database import execute
 
 logger = logging.getLogger(__name__)
 
 #: Nama cookie sesi. `HttpOnly` wajib (JavaScript tidak boleh bisa membacanya),
 #: `SameSite=Lax` mencegah CSRF pada form lintas-situs.
 SESSION_COOKIE = "adms_admin_session"
-
-
-async def _run_blocking(func, /, **kwargs):
-    """Jalankan pekerjaan database blocking di worker thread."""
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
 
 def _credentials_error(detail: str) -> HTTPException:
@@ -47,13 +40,9 @@ async def current_admin(request: Request) -> auth.AdminUser:
     if not token:
         raise _credentials_error("Belum login.")
 
-    def _resolve() -> auth.AdminUser | None:
-        with connection() as conn:
-            admin = auth.resolve_session(conn, token)
-            conn.commit()
-            return admin
-
-    admin = await _run_blocking(_resolve)
+    # `resolve_session` juga menyentuh `last_used_at`, jadi ini penulisan —
+    # pakai `execute`, bukan `fetch`, supaya jejaknya benar-benar tersimpan.
+    admin = await execute(auth.resolve_session, token=token)
     if admin is None:
         raise _credentials_error("Sesi tidak sah atau sudah berakhir.")
 
@@ -76,4 +65,4 @@ async def require_superuser(
     return admin
 
 
-__all__ = ["SESSION_COOKIE", "current_admin", "require_superuser", "_run_blocking"]
+__all__ = ["SESSION_COOKIE", "current_admin", "require_superuser"]

@@ -8,23 +8,17 @@ request mentah, dan ringkasan kesehatan 24 jam terakhir.
 from __future__ import annotations
 
 import logging
-from functools import partial
 
-import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.admin import auth, queries_devices, schemas
 from app.admin.dependencies import current_admin
-from app.database import connection
+from app.database import execute, fetch
 from app.iclock import timezones
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/devices", tags=["admin:devices"])
-
-
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
 
 def _device_out(row: dict[str, object]) -> schemas.DeviceOut:
@@ -48,6 +42,30 @@ def _device_out(row: dict[str, object]) -> schemas.DeviceOut:
     )
 
 
+def _request_out(row: dict[str, object], *, body_raw: str | None = None) -> schemas.RequestOut:
+    """Bentuk satu baris arsip request. `body_raw` hanya diisi pada endpoint detail."""
+    return schemas.RequestOut(
+        id=int(row["id"]),
+        device_id=row.get("device_id"),
+        serial_number=row["serial_number"],
+        endpoint=row["endpoint"],
+        http_method=row["http_method"],
+        table_name=row.get("table_name"),
+        body_bytes=int(row.get("body_bytes") or 0),
+        line_count=int(row.get("line_count") or 0),
+        parsed_count=int(row.get("parsed_count") or 0),
+        stored_count=int(row.get("stored_count") or 0),
+        dup_count=int(row.get("dup_count") or 0),
+        failed_count=int(row.get("failed_count") or 0),
+        process_status=row["process_status"],
+        error_message=row.get("error_message"),
+        source_ip=row.get("source_ip"),
+        created_at=schemas._iso(row.get("created_at")),
+        processed_at=schemas._iso(row.get("processed_at")),
+        body_raw=body_raw,
+    )
+
+
 @router.get("", response_model=schemas.DeviceListResponse)
 async def list_devices(
     status_filter: str | None = Query(default=None, alias="status"),
@@ -62,13 +80,13 @@ async def list_devices(
     (`last_seen_at IS NULL` diurutkan terpisah) — device `pending` yang belum
     pernah connect tidak perlu menutupi device yang sedang bermasalah.
     """
-    def _load():
-        with connection() as conn:
-            return queries_devices.list_devices(
-                conn, status=status_filter, search=search, limit=limit, offset=offset
-            )
-
-    total, rows = await _run_blocking(_load)
+    total, rows = await fetch(
+        queries_devices.list_devices,
+        status=status_filter,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
     return schemas.DeviceListResponse(
         total=total, devices=[_device_out(r) for r in rows]
     )
@@ -79,11 +97,7 @@ async def device_summary(
     _: auth.AdminUser = Depends(current_admin),
 ) -> dict[str, int]:
     """Ringkasan device + kesehatan request 24 jam terakhir."""
-    def _load():
-        with connection() as conn:
-            return queries_devices.device_health_summary(conn)
-
-    return await _run_blocking(_load)
+    return await fetch(queries_devices.device_health_summary)
 
 
 @router.get("/{device_id}", response_model=schemas.DeviceOut)
@@ -91,11 +105,7 @@ async def get_device(
     device_id: int,
     _: auth.AdminUser = Depends(current_admin),
 ) -> schemas.DeviceOut:
-    def _load():
-        with connection() as conn:
-            return queries_devices.get_device(conn, device_id)
-
-    row = await _run_blocking(_load)
+    row = await fetch(queries_devices.get_device, device_id=device_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Device tidak ditemukan."
@@ -125,45 +135,32 @@ async def update_device(
             ),
         )
 
-    tz_offset = None
+    # Normalisasi alias (WIB → Asia/Jakarta) sekali saja, lalu pakai hasilnya
+    # untuk nama zona maupun cache offset.
+    tz_name: str | None = None
+    tz_offset: int | None = None
     if payload.tz_name is not None:
-        resolved = timezones.resolve_zone(payload.tz_name)
-        tz_offset = timezones.zone_offset_minutes(resolved.name)
+        tz_name = timezones.resolve_zone(payload.tz_name).name
+        tz_offset = timezones.zone_offset_minutes(tz_name)
 
-    def _update() -> bool:
-        with connection() as conn:
-            changed = queries_devices.update_device(
-                conn,
-                device_id,
-                display_name=payload.display_name,
-                location=payload.location,
-                status=payload.status,
-                tz_name=timezones.resolve_zone(payload.tz_name).name
-                if payload.tz_name
-                else None,
-                tz_offset_minutes=tz_offset,
-            )
-            conn.commit()
-            return changed
-
-    changed = await _run_blocking(_update)
+    changed = await execute(
+        queries_devices.update_device,
+        device_id=device_id,
+        display_name=payload.display_name,
+        location=payload.location,
+        status=payload.status,
+        tz_name=tz_name,
+        tz_offset_minutes=tz_offset,
+    )
     if not changed:
         # Tidak ada field yang berubah, atau device tidak ada — bedakan supaya
         # klien tahu apakah permintaannya salah atau memang no-op.
-        def _exists() -> bool:
-            with connection() as conn:
-                return queries_devices.get_device(conn, device_id) is not None
-
-        if not await _run_blocking(_exists):
+        if await fetch(queries_devices.get_device, device_id=device_id) is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Device tidak ditemukan."
             )
 
-    def _reload():
-        with connection() as conn:
-            return queries_devices.get_device(conn, device_id)
-
-    row = await _run_blocking(_reload)
+    row = await fetch(queries_devices.get_device, device_id=device_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Device tidak ditemukan."
@@ -177,20 +174,13 @@ async def approve_device(
     _: auth.AdminUser = Depends(current_admin),
 ) -> schemas.MessageResponse:
     """Setujui device `pending` supaya datanya dipercaya."""
-    def _approve() -> bool:
-        with connection() as conn:
-            ok = queries_devices.approve_device(conn, device_id)
-            conn.commit()
-            return ok
-
-    if not await _run_blocking(_approve):
+    ok = await execute(queries_devices.approve_device, device_id=device_id)
+    if not ok:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Device tidak ditemukan atau statusnya bukan 'pending'.",
         )
-    return schemas.MessageResponse(
-        message="Device disetujui.", id=device_id
-    )
+    return schemas.MessageResponse(message="Device disetujui.", id=device_id)
 
 
 # --- Arsip request --------------------------------------------------------
@@ -212,43 +202,17 @@ async def list_requests(
     _: auth.AdminUser = Depends(current_admin),
 ) -> schemas.RequestListResponse:
     """Arsip request mentah (tanpa body, agar respons tetap ringan)."""
-    def _load():
-        with connection() as conn:
-            return queries_devices.list_requests(
-                conn,
-                serial_number=serial_number,
-                table_name=table_name,
-                process_status=process_status,
-                since=since,
-                limit=limit,
-                offset=offset,
-            )
-
-    total, rows = await _run_blocking(_load)
+    total, rows = await fetch(
+        queries_devices.list_requests,
+        serial_number=serial_number,
+        table_name=table_name,
+        process_status=process_status,
+        since=since,
+        limit=limit,
+        offset=offset,
+    )
     return schemas.RequestListResponse(
-        total=total,
-        requests=[
-            schemas.RequestOut(
-                id=int(r["id"]),
-                device_id=r.get("device_id"),
-                serial_number=r["serial_number"],
-                endpoint=r["endpoint"],
-                http_method=r["http_method"],
-                table_name=r.get("table_name"),
-                body_bytes=int(r.get("body_bytes") or 0),
-                line_count=int(r.get("line_count") or 0),
-                parsed_count=int(r.get("parsed_count") or 0),
-                stored_count=int(r.get("stored_count") or 0),
-                dup_count=int(r.get("dup_count") or 0),
-                failed_count=int(r.get("failed_count") or 0),
-                process_status=r["process_status"],
-                error_message=r.get("error_message"),
-                source_ip=r.get("source_ip"),
-                created_at=schemas._iso(r.get("created_at")),
-                processed_at=schemas._iso(r.get("processed_at")),
-            )
-            for r in rows
-        ],
+        total=total, requests=[_request_out(r) for r in rows]
     )
 
 
@@ -264,11 +228,7 @@ async def get_request(
     itu pemborosan. Pemotongan dilakukan di sini, bukan di query, supaya
     `body_raw` tetap utuh di database.
     """
-    def _load():
-        with connection() as conn:
-            return queries_devices.get_request(conn, request_id)
-
-    row = await _run_blocking(_load)
+    row = await fetch(queries_devices.get_request, request_id=request_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Request tidak ditemukan."
@@ -278,23 +238,4 @@ async def get_request(
     if isinstance(body, str) and len(body) > 100_000:
         body = body[:100_000] + "\n... (dipotong untuk tampilan)"
 
-    return schemas.RequestOut(
-        id=int(row["id"]),
-        device_id=row.get("device_id"),
-        serial_number=row["serial_number"],
-        endpoint=row["endpoint"],
-        http_method=row["http_method"],
-        table_name=row.get("table_name"),
-        body_bytes=int(row.get("body_bytes") or 0),
-        line_count=int(row.get("line_count") or 0),
-        parsed_count=int(row.get("parsed_count") or 0),
-        stored_count=int(row.get("stored_count") or 0),
-        dup_count=int(row.get("dup_count") or 0),
-        failed_count=int(row.get("failed_count") or 0),
-        process_status=row["process_status"],
-        error_message=row.get("error_message"),
-        source_ip=row.get("source_ip"),
-        created_at=schemas._iso(row.get("created_at")),
-        processed_at=schemas._iso(row.get("processed_at")),
-        body_raw=body,
-    )
+    return _request_out(row, body_raw=body)

@@ -8,7 +8,7 @@ yang ditemukan lewat verifikasi MySQL:
    setempat, punch 01:45 UTC yang seharusnya "telat 30 menit" terbaca
    "telat 1000 menit". Uji di bawah menegaskan fungsi ini bekerja pada jam
    dinding — dan uji e2e-lah yang memastikan pemanggilnya mengirim jam lokal.
-2. **`_work_days_list` menerima `set` dari MySQL.** Kolom `SET` dikembalikan
+2. **`work_days_list` menerima `set` dari MySQL.** Kolom `SET` dikembalikan
    driver sebagai `set` Python, dan `str(set)` pernah lolos ke respons API
    sebagai `"{'MO', 'TU'}"`. Uji ini menjaga bentuknya tetap daftar terurut.
 """
@@ -19,8 +19,8 @@ from datetime import date, datetime
 
 import pytest
 
+from app.admin.helpers import work_days_list
 from app.admin.queries_attendance import _compute_shift_deltas
-from app.admin.router_master import _work_days_list
 
 WORK_DATE = date(2026, 9, 28)  # Senin
 
@@ -189,12 +189,12 @@ def test_selisih_bertipe_int_bukan_float() -> None:
 def test_work_days_dinormalkan_ke_daftar_terurut(masukan: object, harapan: list[str]) -> None:
     """MySQL mengembalikan kolom `SET` sebagai `set` Python; jangan bocorkan
     bentuk itu ke API."""
-    assert _work_days_list(masukan) == harapan
+    assert work_days_list(masukan) == harapan
 
 
 def test_work_days_bukan_repr_set() -> None:
     """Regresi: pernah keluar sebagai \"{'MO', 'TU'}\" di respons JSON."""
-    hasil = _work_days_list({"MO", "TU", "WE"})
+    hasil = work_days_list({"MO", "TU", "WE"})
 
     assert isinstance(hasil, list)
     assert all(isinstance(d, str) and "{" not in d and "'" not in d for d in hasil)

@@ -13,23 +13,18 @@ selain mengubah database manual.
 from __future__ import annotations
 
 import logging
-from functools import partial
+from typing import Any
 
-import anyio.to_thread
 import mysql.connector
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.admin import auth, schemas
 from app.admin.dependencies import require_superuser
-from app.database import connection
+from app.database import execute, fetch
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/accounts", tags=["admin:accounts"])
-
-
-async def _run_blocking(func, /, **kwargs):
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
 
 
 def _account_out(row: dict[str, object]) -> dict[str, object]:
@@ -44,15 +39,28 @@ def _account_out(row: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _create_admin(conn: Any, **fields: object) -> int:
+    """Buat akun, terjemahkan galat UNIQUE (1062) menjadi 409 yang bisa dibaca.
+
+    `execute()` yang memanggilnya akan meng-`rollback` transaksi begitu
+    `HTTPException` dilempar dari sini, jadi tidak perlu rollback manual.
+    """
+    try:
+        return auth.create_admin(conn, **fields)
+    except mysql.connector.Error as exc:
+        if exc.errno == 1062:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Username {fields.get('username')!r} sudah dipakai.",
+            ) from exc
+        raise
+
+
 @router.get("")
 async def list_accounts(
     _: auth.AdminUser = Depends(require_superuser),
 ) -> dict[str, object]:
-    def _load():
-        with connection() as conn:
-            return auth.list_admins(conn)
-
-    rows = await _run_blocking(_load)
+    rows = await fetch(auth.list_admins)
     return {"total": len(rows), "accounts": [_account_out(r) for r in rows]}
 
 
@@ -61,28 +69,13 @@ async def create_account(
     payload: schemas.AdminCreateRequest,
     admin: auth.AdminUser = Depends(require_superuser),
 ) -> dict[str, object]:
-    def _create() -> int:
-        with connection() as conn:
-            try:
-                admin_id = auth.create_admin(
-                    conn,
-                    username=payload.username,
-                    password=payload.password,
-                    display_name=payload.display_name,
-                    is_superuser=payload.is_superuser,
-                )
-            except mysql.connector.Error as exc:
-                conn.rollback()
-                if exc.errno == 1062:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Username {payload.username!r} sudah dipakai.",
-                    ) from exc
-                raise
-            conn.commit()
-            return admin_id
-
-    admin_id = await _run_blocking(_create)
+    admin_id = await execute(
+        _create_admin,
+        username=payload.username,
+        password=payload.password,
+        display_name=payload.display_name,
+        is_superuser=payload.is_superuser,
+    )
     logger.info(
         "Akun admin %r (id=%s) dibuat oleh superuser %r",
         payload.username, admin_id, admin.username,
@@ -126,13 +119,8 @@ async def update_account(
                 detail="Tidak bisa menonaktifkan akun sendiri.",
             )
 
-    def _update() -> bool:
-        with connection() as conn:
-            changed = auth.update_admin(conn, admin_id, **fields)
-            conn.commit()
-            return changed
-
-    if not await _run_blocking(_update):
+    changed = await execute(auth.update_admin, admin_id=admin_id, **fields)
+    if not changed:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Akun tidak ditemukan atau tidak ada perubahan.",

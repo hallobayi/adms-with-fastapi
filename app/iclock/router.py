@@ -25,20 +25,20 @@ Catatan yang menentukan berhasil/gagal:
 - **Penyimpanan berjalan di thread pool.** `mysql-connector` bersifat
   blocking, sedangkan endpoint di sini `async`. Menjalankan I/O database
   langsung di event loop akan memblokir *seluruh* device lain selama satu
-  batch ditulis; `anyio.to_thread.run_sync` memindahkannya ke worker thread
-  sehingga banyak device bisa ditangani bersamaan.
+  batch ditulis; `_run_blocking` (alias `app.database.run_in_thread`)
+  memindahkannya ke worker thread sehingga banyak device bisa ditangani
+  bersamaan.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from functools import partial
 
-import anyio.to_thread
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import PlainTextResponse
 
+from app.database import run_in_thread
 from app.iclock import ingest, protocol
 
 logger = logging.getLogger(__name__)
@@ -49,21 +49,11 @@ router = APIRouter(prefix="/iclock", tags=["iclock"])
 #: middleware menambahkan charset yang membingungkan firmware lama.
 PLAIN = {"Content-Type": "text/plain"}
 
-
-async def _run_blocking(func, /, **kwargs):
-    """Jalankan fungsi yang memakai I/O database blocking di worker thread.
-
-    Endpoint `/iclock/*` didefinisikan `async` (FastAPI hanya memberi thread
-    pool otomatis pada endpoint `def`), tetapi `mysql-connector` tidak punya
-    API async. Menjalankannya langsung akan menahan event loop selama kueri
-    berlangsung — dan karena device melakukan polling berkala, satu batch
-    besar milik satu device bisa menunda semua device lain.
-
-    `anyio.to_thread.run_sync` (yang dipakai Starlette sendiri di balik layar)
-    memindahkan pekerjaan itu ke worker thread, sehingga event loop tetap
-    melayani request lain sambil menunggu MySQL.
-    """
-    return await anyio.to_thread.run_sync(partial(func, **kwargs))
+#: Nama historis untuk `app.database.run_in_thread`. Dulu fungsi ini disalin ke
+#: setiap router yang butuh; sekarang implementasinya hanya satu, di
+#: `app/database.py`, dan modul ini memakai nama lamanya supaya titik
+#: pemanggilan di bawah tidak perlu ikut berubah.
+_run_blocking = run_in_thread
 
 
 def _client_ip(request: Request) -> str | None:

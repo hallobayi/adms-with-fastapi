@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-from functools import partial
-
-import anyio.to_thread
 from fastapi import APIRouter
 
 from app import database
@@ -31,7 +28,7 @@ async def health() -> HealthResponse:
     MySQL tidak menjawab, kita tidak ingin probe ini menahan event loop —
     endpoint `/iclock/*` harus tetap dilayani selama itu.
     """
-    db_ok = await anyio.to_thread.run_sync(partial(database.ping))
+    db_ok = await database.run_in_thread(database.ping)
     return HealthResponse(
         status="ok",
         database="ok" if db_ok else "degraded",
